@@ -146,7 +146,7 @@ async def build_match_summary(
     }
 
 
-async def get_recent_matches(puuid: str, region_key: str, count: int = 20) -> List[Dict[str, Any]]:
+async def get_recent_matches(puuid: str, region_key: str, count: int = 10) -> List[Dict[str, Any]]:
     match_ids = await get_match_ids(puuid, region_key, count=count)
     champ_map = await _get_champion_map()
     item_map = await _get_item_map()

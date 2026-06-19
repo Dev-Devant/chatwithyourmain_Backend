@@ -172,7 +172,7 @@ async def get_summoner_and_mastery(riot_id: str, region_key: str) -> Dict[str, A
 
     # --- NUEVO: historial de partidas, por ahora solo a consola ---
     try:
-        matches = await get_recent_matches(puuid, region_key, count=20)
+        matches = await get_recent_matches(puuid, region_key, count=10)
         print_history_report(f"{account.get('gameName', game_name)}#{account.get('tagLine', tag_line)}", matches)
     except Exception:
         logger.exception("No se pudo obtener el historial de partidas")
