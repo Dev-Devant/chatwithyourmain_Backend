@@ -69,7 +69,7 @@ async def build_match_summary(
     puuid: str,
     champ_map: Dict[int, str],
     item_map: Dict[int, str],
-) -> Optional[Dict[str, Any]]:
+    ) -> Optional[Dict[str, Any]]:
     try:
         match = await get_match_detail(match_id, region_key)
     except Exception:
@@ -186,11 +186,38 @@ def flag_notable_games(summaries: List[Dict[str, Any]]) -> List[str]:
             )
     return notes
 
+def _relative_time(played_at_iso: Optional[str]) -> str:
+    """Convierte un ISO timestamp a algo legible como 'hace 2 días'."""
+    if not played_at_iso:
+        return "fecha desconocida"
+    try:
+        played_at = datetime.fromisoformat(played_at_iso)
+    except ValueError:
+        return "fecha desconocida"
+
+    now = datetime.now(timezone.utc)
+    delta = now - played_at
+    seconds = delta.total_seconds()
+
+    if seconds < 3600:
+        minutes = max(1, int(seconds // 60))
+        return f"hace {minutes} minuto{'s' if minutes != 1 else ''}"
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"hace {hours} hora{'s' if hours != 1 else ''}"
+    days = int(seconds // 86400)
+    if days == 1:
+        return "ayer"
+    if days < 30:
+        return f"hace {days} días"
+    months = days // 30
+    return f"hace {months} mes{'es' if months != 1 else ''}"
+
 def build_player_context(summaries: List[Dict[str, Any]]) -> str:
     """
-    Convierte el historial de partidas en un texto compacto para meter en el
-    system prompt de la IA. Pensado para que el modelo lo use de forma
-    natural, no para que lo recite tal cual.
+    Convierte el historial de partidas en un texto compacto para el system
+    prompt de la IA. Deja explícito el orden cronológico para que el modelo
+    no tenga que inferirlo de las fechas ISO.
     """
     if not summaries:
         return "No hay datos de partidas recientes disponibles para este jugador."
@@ -202,36 +229,41 @@ def build_player_context(summaries: List[Dict[str, Any]]) -> str:
     lines = [
         f"Resumen de las últimas {total} partidas: {wins} victorias, {losses} derrotas.",
         "",
-        "Detalle partida por partida (de la más reciente a la más antigua):",
+        "IMPORTANTE: la lista está ordenada de la MÁS RECIENTE a la MÁS ANTIGUA. "
+        "La partida #1 es la última que jugó (la de ahora/recién). La última de la lista "
+        "es la más vieja de este historial.",
+        "",
     ]
 
-    for s in summaries:
-        result = "ganada" if s["win"] else "perdida"
+    for index, s in enumerate(summaries, start=1):
+        result = "GANADA" if s["win"] else "PERDIDA"
         opp = f" contra {s['opponent']['champion']}" if s["opponent"] else ""
         items = ", ".join(s["items"]) if s["items"] else "sin build registrada"
+        when = _relative_time(s["playedAt"])
+        tag = " <- LA MÁS RECIENTE" if index == 1 else ""
+
         lines.append(
-            f"- {s['playedAt']}: {s['champion']} ({s['role']}){opp}, "
-            f"{s['kills']}/{s['deaths']}/{s['assists']} (KDA {s['kda']}), partida {result}. "
+            f"#{index} ({when}){tag}: jugó {s['champion']} ({s['role']}){opp}. "
+            f"Resultado: {s['kills']}/{s['deaths']}/{s['assists']} (KDA {s['kda']}), partida {result}. "
             f"Build: {items}. CS/min: {s['csPerMin']}."
         )
 
     recency = build_champion_recency(summaries)
     if recency:
         lines.append("")
-        lines.append("Última vez jugado por campeón (dentro de este historial reciente):")
+        lines.append("Última vez que jugó cada campeón (dentro de este historial reciente):")
         for champ, date in recency.items():
-            lines.append(f"- {champ}: {date}")
+            lines.append(f"- {champ}: {_relative_time(date)}")
 
     notes = flag_notable_games(summaries)
     if notes:
         lines.append("")
-        lines.append("Partidas notables:")
+        lines.append("Partidas notables para comentar:")
         for note in notes:
             lines.append(f"- {note}")
 
     return "\n".join(lines)
 
-    
 def print_history_report(summoner_label: str, summaries: List[Dict[str, Any]]) -> None:
     print(f"\n========== Historial de {summoner_label} ==========")
 
