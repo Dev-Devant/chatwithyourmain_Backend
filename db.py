@@ -19,7 +19,7 @@ async def init_db():
         min_size=1,
         max_size=10,
         command_timeout=10,
-        ssl="disable" if "railway.internal" in database_url else "require",
+        timeout=10
     )
     logger.info("aaaaaaaaaaaa")
 
