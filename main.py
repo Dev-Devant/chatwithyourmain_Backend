@@ -4,7 +4,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from ia import get_ai_response
 from riot import get_summoner_and_mastery, REGION_MAP
 
 logging.basicConfig(level=logging.INFO)
