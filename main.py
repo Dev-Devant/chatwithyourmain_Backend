@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
 from ia import get_ai_response
+from db import init_db, close_db, save_summoner, list_summoners
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
@@ -19,6 +21,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await close_db()
 
 # =========================
 # Modelos
@@ -71,6 +81,17 @@ async def _handle_summoner(summoner_name: str, region: str):
         if region not in REGION_MAP:
             raise HTTPException(status_code=400, detail="Región no soportada")
         result = await get_summoner_and_mastery(summoner_name, region)
+
+        # Guardamos/actualizamos el summoner en la base
+        await save_summoner(
+            puuid=result["puuid"],
+            game_name=result["name"],
+            tag_line=result["tagLine"],
+            region=result["region"],
+            icon_id=result["iconId"],
+            level=result["level"],
+        )
+
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -81,7 +102,6 @@ async def _handle_summoner(summoner_name: str, region: str):
     except Exception:
         logger.exception("Error en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
-
 
 
 
@@ -109,7 +129,10 @@ async def chat(request: ChatRequest):
     return {"text": text}
 
     
-
+@app.get("/api/summoners")
+async def get_summoners(limit: int = 50):
+    return await list_summoners(limit)
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
