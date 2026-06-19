@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+from ia import get_ai_response
 from riot import get_summoner_and_mastery, REGION_MAP
 
 logging.basicConfig(level=logging.INFO)
@@ -25,13 +26,11 @@ app.add_middleware(
 # =========================
 
 class SummonerRequest(BaseModel):
-    game_name: str
-    tag_line: str
-    region: str   # "LAN", "NA", etc.
+    name: str   # solo nombre, sin tag
+    region: str
 
 class SummonerResponse(BaseModel):
     name: str
-    tag: str
     region: str
     level: int
     iconId: int
@@ -48,12 +47,16 @@ async def health():
 
 @app.post("/api/summoner", response_model=SummonerResponse)
 async def get_summoner(request: SummonerRequest):
+    """
+    Busca un invocador por nombre y región (SIN tagline).
+    """
     try:
+        # Validar región
         if request.region not in REGION_MAP:
             raise HTTPException(status_code=400, detail="Región no soportada")
+
         result = await get_summoner_and_mastery(
-            game_name=request.game_name,
-            tag_line=request.tag_line,
+            summoner_name=request.name,
             region_key=request.region
         )
         return result
@@ -67,7 +70,6 @@ async def get_summoner(request: SummonerRequest):
         logger.exception("Error en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
-        
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
