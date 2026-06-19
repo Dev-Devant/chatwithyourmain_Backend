@@ -186,7 +186,52 @@ def flag_notable_games(summaries: List[Dict[str, Any]]) -> List[str]:
             )
     return notes
 
+def build_player_context(summaries: List[Dict[str, Any]]) -> str:
+    """
+    Convierte el historial de partidas en un texto compacto para meter en el
+    system prompt de la IA. Pensado para que el modelo lo use de forma
+    natural, no para que lo recite tal cual.
+    """
+    if not summaries:
+        return "No hay datos de partidas recientes disponibles para este jugador."
 
+    total = len(summaries)
+    wins = sum(1 for s in summaries if s["win"])
+    losses = total - wins
+
+    lines = [
+        f"Resumen de las últimas {total} partidas: {wins} victorias, {losses} derrotas.",
+        "",
+        "Detalle partida por partida (de la más reciente a la más antigua):",
+    ]
+
+    for s in summaries:
+        result = "ganada" if s["win"] else "perdida"
+        opp = f" contra {s['opponent']['champion']}" if s["opponent"] else ""
+        items = ", ".join(s["items"]) if s["items"] else "sin build registrada"
+        lines.append(
+            f"- {s['playedAt']}: {s['champion']} ({s['role']}){opp}, "
+            f"{s['kills']}/{s['deaths']}/{s['assists']} (KDA {s['kda']}), partida {result}. "
+            f"Build: {items}. CS/min: {s['csPerMin']}."
+        )
+
+    recency = build_champion_recency(summaries)
+    if recency:
+        lines.append("")
+        lines.append("Última vez jugado por campeón (dentro de este historial reciente):")
+        for champ, date in recency.items():
+            lines.append(f"- {champ}: {date}")
+
+    notes = flag_notable_games(summaries)
+    if notes:
+        lines.append("")
+        lines.append("Partidas notables:")
+        for note in notes:
+            lines.append(f"- {note}")
+
+    return "\n".join(lines)
+
+    
 def print_history_report(summoner_label: str, summaries: List[Dict[str, Any]]) -> None:
     print(f"\n========== Historial de {summoner_label} ==========")
 
@@ -225,3 +270,6 @@ def print_history_report(summoner_label: str, summaries: List[Dict[str, Any]]) -
             print(f"  • {note}")
 
     print("=" * 50 + "\n")
+
+
+

@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from riot import get_summoner_and_mastery, REGION_MAP
+from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_context
 from ia import get_ai_response
 
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +42,8 @@ class ChatRequest(BaseModel):
     persona: str
     history: List[ChatHistoryItem] = Field(default_factory=list)
     message: str
-
+    puuid: str
+    region: str
 
 # =========================
 # Endpoints
@@ -82,12 +83,19 @@ async def _handle_summoner(summoner_name: str, region: str):
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 
+
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío")
 
+    if request.region not in REGION_MAP:
+        raise HTTPException(status_code=400, detail="Región no soportada")
+
     history = [{"role": item.role, "text": item.text} for item in request.history]
+
+    player_context = await get_cached_player_context(request.puuid, request.region)
 
     text = await get_ai_response(
         champion_name=request.championName,
@@ -95,9 +103,11 @@ async def chat(request: ChatRequest):
         persona=request.persona,
         history=history,
         message=request.message,
+        player_context=player_context,
     )
     return {"text": text}
 
+    
 
 if __name__ == "__main__":
     import uvicorn
