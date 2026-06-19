@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Optional
 
 import httpx
 
-from riot import _call_riot_api, CONTINENT_MAP, _get_champion_map
+from riot_client import _call_riot_api, CONTINENT_MAP, _get_champion_map
 
 logger = logging.getLogger(__name__)
 
