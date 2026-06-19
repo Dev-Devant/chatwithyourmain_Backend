@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 RIOT_API_KEY = os.getenv("RIOT_API_KEY")
 if not RIOT_API_KEY:
     logger.warning("RIOT_API_KEY no configurada. Las llamadas a Riot fallarán.")
+else
+    logger.warning("riot ap: " + RIOT_API_KEY)
+
 
 # Mapeo de regiones del frontend a regiones de la API de Riot
 REGION_MAP = {
