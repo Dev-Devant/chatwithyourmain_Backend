@@ -21,6 +21,8 @@ async def init_db():
         command_timeout=10,
         ssl="disable" if "railway.internal" in database_url else "require",
     )
+    logger.info("aaaaaaaaaaaa")
+
     await _ensure_schema()
     logger.info("Pool de Postgres inicializado")
 
