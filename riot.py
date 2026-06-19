@@ -7,12 +7,12 @@ logger = logging.getLogger(__name__)
 
 RIOT_API_KEY = os.getenv("RIOT_API_KEY")
 if not RIOT_API_KEY:
-    logger.warning("RIOT_API_KEY no configurada. Las llamadas a Riot fallarán.")
+    logger.warning("RIOT_API_KEY no configurada")
 
 # Mapeo de regiones del frontend a regiones de la API de Riot
 REGION_MAP = {
-    "LAN": "lan1",
-    "LAS": "las1",
+    "LAN": "la1",   # Nota: LAN y LAS usan la1 y la2
+    "LAS": "la2",
     "NA": "na1",
     "EUW": "euw1",
     "EUNE": "eun1",
@@ -24,25 +24,12 @@ REGION_MAP = {
     "TR": "tr1"
 }
 
-# Mapeo de regiones a clusters para Account-V1
-CLUSTER_MAP = {
-    "lan1": "americas",
-    "las1": "americas",
-    "na1": "americas",
-    "br1": "americas",
-    "oc1": "americas",
-    "euw1": "europe",
-    "eun1": "europe",
-    "tr1": "europe",
-    "ru": "europe",
-    "kr": "asia",
-    "jp1": "asia",
-}
-
+# Cache de campeones
 _CHAMPION_MAP = None
 
-# --------------------------------------------------------------
-
+# ------------------------------------------------------------
+# Funciones auxiliares
+# ------------------------------------------------------------
 async def _get_champion_map() -> Dict[int, str]:
     global _CHAMPION_MAP
     if _CHAMPION_MAP is not None:
@@ -56,59 +43,50 @@ async def _get_champion_map() -> Dict[int, str]:
     for key, champ_data in data["data"].items():
         champion_map[int(champ_data["key"])] = key
     _CHAMPION_MAP = champion_map
-    logger.info("Mapeo de campeones cargado (%d campeones)", len(champion_map))
+    logger.info("Mapeo de campeones cargado (%d)", len(champion_map))
     return champion_map
 
 
 async def _call_riot_api(url: str) -> Dict[str, Any]:
+    """Llamada GET a la API de Riot con manejo de errores."""
     if not RIOT_API_KEY:
         raise RuntimeError("RIOT_API_KEY no configurada")
     async with httpx.AsyncClient() as client:
         headers = {"X-Riot-Token": RIOT_API_KEY}
         resp = await client.get(url, headers=headers)
-        if resp.status_code == 403:
-            raise PermissionError("Clave API inválida o sin permisos. Revisa tu RIOT_API_KEY.")
-        elif resp.status_code == 404:
+        if resp.status_code == 404:
             raise ValueError("Invocador no encontrado")
+        elif resp.status_code == 403:
+            raise PermissionError("Clave API inválida o sin permisos")
         elif resp.status_code == 429:
-            raise RuntimeError("Demasiadas peticiones a Riot. Espera un momento.")
+            raise RuntimeError("Rate limit excedido. Espera un momento.")
         elif resp.status_code >= 400:
-            raise RuntimeError(f"Error de Riot API: {resp.status_code} - {resp.text}")
+            raise RuntimeError(f"Error Riot API: {resp.status_code} - {resp.text}")
         return resp.json()
 
-
-# ------------------------------------------------------------------
-# FUNCIONES PRINCIPALES - CON BÚSQUEDA POR NOMBRE (sin tag)
-# ------------------------------------------------------------------
-
-async def get_puuid_by_name(summoner_name: str, region_key: str) -> str:
+# ------------------------------------------------------------
+# Función principal: buscar por nombre de invocador (sin tag)
+# ------------------------------------------------------------
+async def get_summoner_by_name(summoner_name: str, region_key: str) -> Dict[str, Any]:
     """
-    Obtiene el PUUID de un invocador buscando por nombre de invocador.
-    Usa la API antigua de Summoner-V4 (por nombre) porque es más simple.
+    Busca un invocador usando el endpoint de Summoner-V4 por nombre.
     """
     region = REGION_MAP.get(region_key)
     if not region:
         raise ValueError(f"Región no soportada: {region_key}")
-
-    # La API de Summoner-V4 usa el nombre de invocador (no Riot ID)
-    url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-name/{summoner_name}"
-    data = await _call_riot_api(url)
-    return data.get("puuid")
-
-
-async def get_summoner_by_puuid(puuid: str, region_key: str) -> Dict[str, Any]:
-    region = REGION_MAP.get(region_key)
-    if not region:
-        raise ValueError(f"Región no soportada: {region_key}")
-    url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
+    
+    # Codificar nombre para URL (espacios)
+    import urllib.parse
+    encoded_name = urllib.parse.quote(summoner_name)
+    url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-name/{encoded_name}"
     data = await _call_riot_api(url)
     return {
-        "id": data.get("id"),
-        "accountId": data.get("accountId"),
-        "puuid": data.get("puuid"),
-        "name": data.get("name"),
-        "profileIconId": data.get("profileIconId"),
-        "summonerLevel": data.get("summonerLevel"),
+        "id": data["id"],
+        "accountId": data["accountId"],
+        "puuid": data["puuid"],
+        "name": data["name"],
+        "profileIconId": data["profileIconId"],
+        "summonerLevel": data["summonerLevel"],
     }
 
 
@@ -117,26 +95,25 @@ async def get_top_masteries(puuid: str, region_key: str, count: int = 6) -> List
     if not region:
         raise ValueError(f"Región no soportada: {region_key}")
     url = f"https://{region}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/top?count={count}"
-    data = await _call_riot_api(url)
-    return data
+    return await _call_riot_api(url)
 
 
 async def get_summoner_and_mastery(summoner_name: str, region_key: str) -> Dict[str, Any]:
     """
-    Función principal: busca por nombre de invocador (sin tag).
+    Obtiene datos del invocador y sus top campeones.
     """
-    # 1. PUUID
-    puuid = await get_puuid_by_name(summoner_name, region_key)
-    # 2. Datos del invocador
-    summoner_data = await get_summoner_by_puuid(puuid, region_key)
-    # 3. Maestrías
+    # 1. Datos del invocador por nombre
+    summoner = await get_summoner_by_name(summoner_name, region_key)
+    puuid = summoner["puuid"]
+
+    # 2. Maestrías
     masteries = await get_top_masteries(puuid, region_key, count=6)
-    # 4. Mapear campeones
-    champion_map = await _get_champion_map()
+
+    # 3. Mapear IDs
+    champ_map = await _get_champion_map()
     top_champs = []
     for m in masteries:
-        champion_id = m.get("championId")
-        champ_key = champion_map.get(champion_id)
+        champ_key = champ_map.get(m.get("championId"))
         if champ_key:
             top_champs.append({
                 "id": champ_key,
@@ -146,13 +123,13 @@ async def get_summoner_and_mastery(summoner_name: str, region_key: str) -> Dict[
                 "masteryLevel": m.get("championLevel"),
             })
         else:
-            logger.warning(f"ID de campeón desconocido: {champion_id}")
+            logger.warning(f"ID de campeón no mapeado: {m.get('championId')}")
 
     return {
-        "name": summoner_data["name"],
+        "name": summoner["name"],
         "region": region_key,
-        "level": summoner_data["summonerLevel"],
-        "iconId": summoner_data["profileIconId"],
+        "level": summoner["summonerLevel"],
+        "iconId": summoner["profileIconId"],
         "puuid": puuid,
         "topChampions": top_champs,
     }
