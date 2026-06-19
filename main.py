@@ -9,12 +9,16 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
 
+
+# =========================
+# APLICACIÓN FASTAPI
+# =========================
 app = FastAPI(title="AI Chat Backend", version="1.0.0")
 
-# Configurar CORS correctamente
+# Middleware CORS para que el frontend pueda llamar desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite todos los orígenes (solo para desarrollo)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,5 +34,5 @@ async def health():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
