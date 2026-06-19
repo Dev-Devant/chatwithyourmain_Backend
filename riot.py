@@ -5,20 +5,15 @@ from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------
-# Configuración
-# ------------------------------------------------------------------
+# Clave de API
 RIOT_API_KEY = os.getenv("RIOT_API_KEY")
 if not RIOT_API_KEY:
     logger.warning("RIOT_API_KEY no configurada. Las llamadas a Riot fallarán.")
-else:
-    logger.warning("riot ap: " + RIOT_API_KEY)
-
 
 # Mapeo de regiones del frontend a regiones de la API de Riot
 REGION_MAP = {
-    "LAN": "lan1",
-    "LAS": "las1",
+    "LAN": "la1",
+    "LAS": "la1",   # Nota: LAS y LAN comparten el mismo cluster de juego (la1)
     "NA": "na1",
     "EUW": "euw1",
     "EUNE": "eun1",
@@ -30,26 +25,21 @@ REGION_MAP = {
     "TR": "tr1"
 }
 
-# Mapeo de regiones a rutas de la API (para Account-V1 usamos americas, europe, asia, etc.)
-# Según la región, elegimos el cluster correcto.
+# Para Account-V1, se necesita el cluster (americas, europe, asia)
 CLUSTER_MAP = {
-    "lan1": "americas",
-    "las1": "americas",
+    "la1": "americas",
     "na1": "americas",
     "br1": "americas",
+    "oc1": "americas",
     "euw1": "europe",
     "eun1": "europe",
     "tr1": "europe",
     "ru": "europe",
     "kr": "asia",
     "jp1": "asia",
-    "oc1": "asia",  # OCE suele ir en americas? En realidad OCE está en Americas, pero lo dejamos así.
 }
-# Nota: para OCE, el cluster es americas, pero la región es oc1.
-# Ajustamos:
-CLUSTER_MAP["oc1"] = "americas"
 
-# Cache para el mapeo de campeones (se carga una vez)
+# Cache de campeones
 _CHAMPION_MAP = None
 
 # ------------------------------------------------------------------
@@ -57,9 +47,6 @@ _CHAMPION_MAP = None
 # ------------------------------------------------------------------
 
 async def _get_champion_map() -> Dict[int, str]:
-    """
-    Descarga y cachea el champion.json de Data Dragon para mapear IDs numéricos a claves.
-    """
     global _CHAMPION_MAP
     if _CHAMPION_MAP is not None:
         return _CHAMPION_MAP
@@ -69,7 +56,6 @@ async def _get_champion_map() -> Dict[int, str]:
         resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
-    # Construir mapeo: ID numérico -> clave (ej. 1 -> "Annie")
     champion_map = {}
     for key, champ_data in data["data"].items():
         champion_map[int(champ_data["key"])] = key
@@ -78,11 +64,7 @@ async def _get_champion_map() -> Dict[int, str]:
     return champion_map
 
 
-async def _call_riot_api(url: str, region: str) -> Dict[str, Any]:
-    """
-    Realiza una llamada GET a la API de Riot con la clave de API.
-    Lanza excepción si el código de estado no es 2xx.
-    """
+async def _call_riot_api(url: str) -> Dict[str, Any]:
     if not RIOT_API_KEY:
         raise RuntimeError("RIOT_API_KEY no configurada")
     async with httpx.AsyncClient() as client:
@@ -98,36 +80,51 @@ async def _call_riot_api(url: str, region: str) -> Dict[str, Any]:
             raise RuntimeError(f"Error de Riot API: {resp.status_code} - {resp.text}")
         return resp.json()
 
-# ------------------------------------------------------------------
-# Funciones principales
-# ------------------------------------------------------------------
 
-async def get_puuid_by_riot_id(game_name: str, tag_line: str, region_key: str) -> str:
+# ------------------------------------------------------------------
+# Búsqueda por nombre (sin tagline) - usando Summoner-V4
+# ------------------------------------------------------------------
+async def get_summoner_by_name(summoner_name: str, region_key: str) -> Dict[str, Any]:
     """
-    Obtiene el PUUID de un invocador usando Account-V1.
-    region_key: "LAN", "NA", etc.
+    Obtiene datos del invocador usando el endpoint clásico por nombre (sin tagline).
     """
     region = REGION_MAP.get(region_key)
     if not region:
         raise ValueError(f"Región no soportada: {region_key}")
-    cluster = CLUSTER_MAP.get(region, "americas")  # Por defecto americas
 
-    # Riot ID puede contener caracteres especiales, codificamos URL
+    # El nombre debe estar codificado para URL (espacios, etc.)
+    encoded_name = httpx.quote(summoner_name)
+    url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-name/{encoded_name}"
+    data = await _call_riot_api(url)
+    return {
+        "id": data.get("id"),
+        "accountId": data.get("accountId"),
+        "puuid": data.get("puuid"),
+        "name": data.get("name"),
+        "profileIconId": data.get("profileIconId"),
+        "summonerLevel": data.get("summonerLevel"),
+    }
+
+
+# ------------------------------------------------------------------
+# Búsqueda por Riot ID (con tagline) - usando Account-V1
+# ------------------------------------------------------------------
+async def get_puuid_by_riot_id(game_name: str, tag_line: str, region_key: str) -> str:
+    region = REGION_MAP.get(region_key)
+    if not region:
+        raise ValueError(f"Región no soportada: {region_key}")
+    cluster = CLUSTER_MAP.get(region, "americas")
     url = f"https://{cluster}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-    data = await _call_riot_api(url, region)
+    data = await _call_riot_api(url)
     return data.get("puuid")
 
 
 async def get_summoner_by_puuid(puuid: str, region_key: str) -> Dict[str, Any]:
-    """
-    Obtiene los datos del invocador (nivel, icono, summonerId) usando Summoner-V4.
-    """
     region = REGION_MAP.get(region_key)
     if not region:
         raise ValueError(f"Región no soportada: {region_key}")
-
     url = f"https://{region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
-    data = await _call_riot_api(url, region)
+    data = await _call_riot_api(url)
     return {
         "id": data.get("id"),
         "accountId": data.get("accountId"),
@@ -139,38 +136,36 @@ async def get_summoner_by_puuid(puuid: str, region_key: str) -> Dict[str, Any]:
 
 
 async def get_top_masteries(puuid: str, region_key: str, count: int = 6) -> List[Dict[str, Any]]:
-    """
-    Obtiene los campeones con mayor maestría.
-    Devuelve lista con {championId, championPoints, championLevel, ...}
-    """
     region = REGION_MAP.get(region_key)
     if not region:
         raise ValueError(f"Región no soportada: {region_key}")
-
     url = f"https://{region}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/top?count={count}"
-    data = await _call_riot_api(url, region)
-    # data es una lista
+    data = await _call_riot_api(url)
     return data
 
 
-async def get_summoner_and_mastery(game_name: str, tag_line: str, region_key: str) -> Dict[str, Any]:
+# ------------------------------------------------------------------
+# Función principal unificada
+# ------------------------------------------------------------------
+async def get_summoner_and_mastery(game_name: str, tag_line: Optional[str], region_key: str) -> Dict[str, Any]:
     """
-    Función principal que combina todo:
-    - Obtiene PUUID
-    - Obtiene datos del invocador
-    - Obtiene top maestrías
-    - Mapea IDs de campeones a nombres
+    Busca invocador. Si se proporciona tag_line, usa Account-V1; si no, usa Summoner-V4 por nombre.
     """
-    # 1. PUUID
-    puuid = await get_puuid_by_riot_id(game_name, tag_line, region_key)
+    # Si no hay tagline, usar búsqueda por nombre (método antiguo)
+    if not tag_line or tag_line.strip() == "":
+        logger.info(f"Buscando por nombre sin tagline: {game_name} en {region_key}")
+        summoner_data = await get_summoner_by_name(game_name, region_key)
+        puuid = summoner_data["puuid"]
+    else:
+        # Primero obtener PUUID con Account-V1
+        puuid = await get_puuid_by_riot_id(game_name, tag_line, region_key)
+        # Luego obtener el resto de datos del invocador con Summoner-V4
+        summoner_data = await get_summoner_by_puuid(puuid, region_key)
 
-    # 2. Datos del invocador
-    summoner_data = await get_summoner_by_puuid(puuid, region_key)
-
-    # 3. Maestrías
+    # Obtener maestrías
     masteries = await get_top_masteries(puuid, region_key, count=6)
 
-    # 4. Mapear IDs de campeones a claves
+    # Mapear IDs de campeones
     champion_map = await _get_champion_map()
     top_champs = []
     for m in masteries:
@@ -179,18 +174,13 @@ async def get_summoner_and_mastery(game_name: str, tag_line: str, region_key: st
         if champ_key:
             top_champs.append({
                 "id": champ_key,
-                "championPoints": m.get("championPoints"),
-                "championLevel": m.get("championLevel"),
-                "masteryPoints": m.get("championPoints"),  # alias para el frontend
                 "masteryLevel": m.get("championLevel"),
+                "masteryPoints": m.get("championPoints"),
             })
-        else:
-            logger.warning(f"ID de campeón desconocido: {champion_id}")
 
-    # Respuesta final
     return {
         "name": summoner_data["name"],
-        "tag": tag_line,
+        "tag": tag_line or "",  # Si no se proporcionó, devolver vacío
         "region": region_key,
         "level": summoner_data["summonerLevel"],
         "iconId": summoner_data["profileIconId"],

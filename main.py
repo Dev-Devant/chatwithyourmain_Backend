@@ -48,15 +48,9 @@ async def health():
 
 @app.post("/api/summoner", response_model=SummonerResponse)
 async def get_summoner(request: SummonerRequest):
-    """
-    Busca un invocador por Riot ID (game_name#tag_line) y región.
-    Devuelve datos del invocador y sus top 6 campeones por maestría.
-    """
     try:
-        # Validar región
         if request.region not in REGION_MAP:
             raise HTTPException(status_code=400, detail="Región no soportada")
-
         result = await get_summoner_and_mastery(
             game_name=request.game_name,
             tag_line=request.tag_line,
@@ -73,6 +67,7 @@ async def get_summoner(request: SummonerRequest):
         logger.exception("Error en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
+        
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
