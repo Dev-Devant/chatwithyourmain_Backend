@@ -1,6 +1,6 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -11,7 +11,6 @@ logger = logging.getLogger("ai-chat")
 
 app = FastAPI(title="AI Chat Backend", version="1.0.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,20 +20,13 @@ app.add_middleware(
 )
 
 # =========================
-# Modelos de datos
+# Modelos
 # =========================
 
-class SummonerRequest(BaseModel):
-    name: str   # solo nombre, sin tag
-    region: str
 
-class SummonerResponse(BaseModel):
-    name: str
+class SummonerRequest(BaseModel):
+    summoner_name: str
     region: str
-    level: int
-    iconId: int
-    puuid: str
-    topChampions: List[Dict[str, Any]]
 
 # =========================
 # Endpoints
@@ -70,7 +62,7 @@ async def _handle_summoner(summoner_name: str, region: str):
     except Exception as e:
         logger.exception("Error en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
-        
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
