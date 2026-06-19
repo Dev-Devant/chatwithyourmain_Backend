@@ -3,22 +3,18 @@ import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uvicorn
 
-# =========================
-# CONFIGURACIÓN
-# =========================
+# Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
 
-# =========================
-# APLICACIÓN FASTAPI
-# =========================
 app = FastAPI(title="AI Chat Backend", version="1.0.0")
 
-# Middleware CORS para que el frontend pueda llamar desde cualquier origen
+# Configurar CORS correctamente
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Permite todos los orígenes (solo para desarrollo)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,16 +22,13 @@ app.add_middleware(
 
 
 
-# =========================
-# ENDPOINTS
-# =========================
+# Endpoints
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
 
-
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
