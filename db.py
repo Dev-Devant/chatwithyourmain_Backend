@@ -21,7 +21,6 @@ async def init_db():
         command_timeout=10,
         timeout=10
     )
-    logger.info("aaaaaaaaaaaa")
 
     await _ensure_schema()
     logger.info("Pool de Postgres inicializado")

@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Any
 from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
 from ia import get_ai_response
 from db import init_db, close_db, save_summoner, list_summoners
+from redis_client import init_redis, close_redis, get_chat_history, append_chat_messages
 
 
 logging.basicConfig(level=logging.INFO)
@@ -22,14 +23,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await init_redis()
 
 @app.on_event("shutdown")
 async def shutdown():
     await close_db()
-
+    await close_redis()
 # =========================
 # Modelos
 # =========================
@@ -44,13 +47,11 @@ class ChatHistoryItem(BaseModel):
     role: str  # "user" | "champion"
     text: str
 
-
 class ChatRequest(BaseModel):
     championId: str
     championName: str
     championTitle: str
     persona: str
-    history: List[ChatHistoryItem] = Field(default_factory=list)
     message: str
     puuid: str
     region: str
@@ -113,7 +114,8 @@ async def chat(request: ChatRequest):
     if request.region not in REGION_MAP:
         raise HTTPException(status_code=400, detail="Región no soportada")
 
-    history = [{"role": item.role, "text": item.text} for item in request.history]
+    # Historial desde Redis en vez del front
+    history = await get_chat_history(request.puuid, request.championId)
 
     player_info = await get_cached_player_info(request.puuid, request.region)
 
@@ -126,13 +128,31 @@ async def chat(request: ChatRequest):
         summoner_name=player_info["name"],
         player_context=player_info["context"],
     )
-    return {"text": text}
 
+    # Guardamos el intercambio en Redis (con su TTL)
+    await append_chat_messages(
+        puuid=request.puuid,
+        champion_id=request.championId,
+        user_message=request.message,
+        champion_message=text,
+    )
+
+    return {"text": text}
     
 @app.get("/api/summoners")
 async def get_summoners(limit: int = 50):
     return await list_summoners(limit)
     
+@app.get("/api/chat/history")
+async def chat_history(puuid: str, championId: str):
+    return await get_chat_history(puuid, championId)
+
+
+@app.delete("/api/chat/history")
+async def delete_chat_history(puuid: str, championId: str):
+    await clear_chat_history(puuid, championId)
+    return {"success": True}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
