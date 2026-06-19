@@ -9,14 +9,13 @@ pool: Optional[asyncpg.Pool] = None
 
 
 async def init_db():
-    """Crea el pool de conexiones y asegura que la tabla exista."""
     global pool
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL no configurada")
+
     pool = await asyncpg.create_pool(
-        user="postgres",
-        password=os.getenv("DB_PASS"),
-        database="railway",
-        host="postgres.railway.internal",
-        port=5432,
+        dsn=database_url,
         min_size=1,
         max_size=10,
         command_timeout=10,
