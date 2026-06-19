@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_context
+from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
 from ia import get_ai_response
 
 logging.basicConfig(level=logging.INFO)
@@ -95,7 +95,7 @@ async def chat(request: ChatRequest):
 
     history = [{"role": item.role, "text": item.text} for item in request.history]
 
-    player_context = await get_cached_player_context(request.puuid, request.region)
+    player_info = await get_cached_player_info(request.puuid, request.region)
 
     text = await get_ai_response(
         champion_name=request.championName,
@@ -103,7 +103,8 @@ async def chat(request: ChatRequest):
         persona=request.persona,
         history=history,
         message=request.message,
-        player_context=player_context,
+        summoner_name=player_info["name"],
+        player_context=player_info["context"],
     )
     return {"text": text}
 
