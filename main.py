@@ -44,20 +44,22 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/api/summoner", response_model=SummonerResponse)
-async def get_summoner(request: SummonerRequest):
-    """
-    Busca un invocador por nombre y región (SIN tagline).
-    """
-    try:
-        # Validar región
-        if request.region not in REGION_MAP:
-            raise HTTPException(status_code=400, detail="Región no soportada")
+@app.post("/api/summoner")
+async def post_summoner(request: SummonerRequest):
+    return await _handle_summoner(request.summoner_name, request.region)
 
-        result = await get_summoner_and_mastery(
-            summoner_name=request.name,
-            region_key=request.region
-        )
+@app.get("/api/summoner")
+async def get_summoner(
+    summoner_name: str = Query(..., description="Nombre de invocador"),
+    region: str = Query(..., description="Región (LAN, NA, EUW, ...)")
+):
+    return await _handle_summoner(summoner_name, region)
+
+async def _handle_summoner(summoner_name: str, region: str):
+    try:
+        if region not in REGION_MAP:
+            raise HTTPException(status_code=400, detail="Región no soportada")
+        result = await get_summoner_and_mastery(summoner_name, region)
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -68,7 +70,7 @@ async def get_summoner(request: SummonerRequest):
     except Exception as e:
         logger.exception("Error en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
-
+        
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
