@@ -30,7 +30,7 @@ ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://chatw
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,  # No usamos cookies ni sesiones
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -58,6 +58,8 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
     logger.warning("JWT_SECRET no configurada, usando valor aleatorio (no recomendado para producción)")
     JWT_SECRET = secrets.token_urlsafe(32)
+else:
+    logger.info("JWT_SECRET configurada desde entorno")
 
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_MINUTES = 60 * 24  # 24 horas
@@ -69,35 +71,44 @@ def create_token(puuid: str, region: str) -> str:
         "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRATION_MINUTES),
         "iat": datetime.now(timezone.utc),
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    logger.info(f"Token generado para puuid {puuid[:8]}...")
+    return token
 
 def decode_token(token: str) -> dict:
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        logger.info(f"Token decodificado correctamente: puuid={payload.get('puuid')}")
+        return payload
     except jwt.ExpiredSignatureError:
+        logger.warning("Token expirado")
         raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.InvalidTokenError:
+    except jwt.InvalidTokenError as e:
+        logger.warning(f"Token inválido: {e}")
         raise HTTPException(status_code=401, detail="Token inválido")
 
 async def get_puuid_from_token(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     token = credentials.credentials
+    logger.info(f"Token recibido (primeros 20 chars): {token[:20]}...")
     payload = decode_token(token)
     puuid = payload.get("puuid")
     region = payload.get("region")
     if not puuid or not region:
+        logger.error("Token mal formado: faltan puuid o region")
         raise HTTPException(status_code=401, detail="Token mal formado")
+    logger.info(f"Token válido para puuid={puuid[:8]}... region={region}")
     return puuid, region
 
 # ==================== Modelos ====================
 class SummonerRequest(BaseModel):
-    summoner_name: str = Field(..., max_length=100, description="Riot ID completo, ej. Nombre#TAG")
+    summoner_name: str = Field(..., max_length=100)
     region: str = Field(..., max_length=10)
 
 class ChatRequest(BaseModel):
     championId: str = Field(..., max_length=50)
-    championName: Optional[str] = None   # se ignora, se obtiene del mapa
-    championTitle: Optional[str] = None  # se ignora o se usa como fallback
-    persona: str = Field(..., max_length=500)  # personalidad enviada por el front
+    championName: Optional[str] = None
+    championTitle: Optional[str] = None
+    persona: str = Field(..., max_length=500)
     message: str = Field(..., max_length=500)
     puuid: str = Field(..., max_length=100)
     region: str = Field(..., max_length=10)
@@ -107,7 +118,6 @@ class ChatRequest(BaseModel):
 async def startup():
     await init_db()
     await init_redis()
-    # Precargar el mapa de campeones para que esté en caché
     await _get_champion_map()
 
 @app.on_event("shutdown")
@@ -133,14 +143,13 @@ async def post_summoner(request: SummonerRequest, http_request: Request):
 
 @app.get("/api/summoner")
 async def get_summoner(
-    summoner_name: str = Query(..., max_length=100, description="Riot ID completo, ej. Nombre#TAG"),
+    summoner_name: str = Query(..., max_length=100),
     region: str = Query(..., max_length=10),
     http_request: Request = None
 ):
     return await _handle_summoner(summoner_name, region, http_request)
 
 async def _handle_summoner(summoner_name: str, region: str, http_request: Request):
-    # Rate limit por IP (búsquedas)
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_search_limit(ip)
     if not allowed:
@@ -163,19 +172,18 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
             level=result["level"],
         )
 
-        # Generar token JWT para este puuid
         token = create_token(result["puuid"], region)
         result["token"] = token
         return result
 
     except ValueError:
-        logger.warning(f"Error de usuario: invocador no encontrado para {summoner_name} en {region}")
+        logger.warning(f"Invocador no encontrado: {summoner_name} en {region}")
         raise HTTPException(status_code=404, detail="Invocador no encontrado. Verifica el Riot ID y la región.")
     except PermissionError:
-        logger.warning(f"Error de permiso en Riot API para {summoner_name}")
+        logger.warning("Error de permiso en Riot API")
         raise HTTPException(status_code=403, detail="Error con la clave API. Contacta al soporte.")
     except RuntimeError:
-        logger.exception(f"Error de Riot API para {summoner_name}")
+        logger.exception("Error de Riot API")
         raise HTTPException(status_code=429, detail="Demasiadas peticiones a Riot. Espera un momento e intenta de nuevo.")
     except Exception:
         logger.exception("Error interno en /api/summoner")
@@ -188,12 +196,13 @@ async def chat(
     token_data: Tuple[str, str] = Depends(get_puuid_from_token)
 ):
     token_puuid, token_region = token_data
+    logger.info(f"Chat request para puuid={request.puuid[:8]}... region={request.region}")
+
     if token_puuid != request.puuid or token_region != request.region:
+        logger.warning(f"Token mismatch: token puuid={token_puuid[:8]} vs request puuid={request.puuid[:8]}")
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
 
-    # Validar championId contra el mapa de campeones de Data Dragon
     champion_map = await _get_champion_map()
-    # champion_map es Dict[int, str] (id numérico -> nombre)
     try:
         champ_id_int = int(request.championId)
     except ValueError:
@@ -201,12 +210,9 @@ async def chat(
     if champ_id_int not in champion_map:
         raise HTTPException(status_code=400, detail="Campeón no soportado o ID inválido")
 
-    # Obtenemos el nombre real del campeón desde el mapa
     real_name = champion_map[champ_id_int]
-    # Usamos el título del front si viene, sino uno genérico
     champion_title = request.championTitle or "Campeón de League of Legends"
 
-    # Rate limit de chat
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_chat_limit(ip)
     if not allowed:
@@ -242,7 +248,6 @@ async def chat_limit(http_request: Request):
     ip = get_client_ip(http_request)
     return await get_chat_limit_status(ip)
 
-# ========== HISTORIAL (protegido con token) ==========
 @app.get("/api/chat/history")
 async def chat_history(
     puuid: str = Query(..., max_length=100),
@@ -252,7 +257,6 @@ async def chat_history(
     token_puuid, token_region = token_data
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-    # Validar championId (opcional)
     champion_map = await _get_champion_map()
     try:
         if int(championId) not in champion_map:
@@ -278,9 +282,6 @@ async def delete_chat_history(
         raise HTTPException(status_code=400, detail="championId debe ser un número")
     await clear_chat_history(puuid, championId)
     return {"success": True}
-
-# ========== ENDPOINT /api/summoners ELIMINADO ==========
-# Se eliminó para no filtrar puuids.
 
 if __name__ == "__main__":
     import uvicorn
