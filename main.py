@@ -1,24 +1,24 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, Query, Request, Depends, status
+from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, Tuple
 import jwt
 from datetime import datetime, timedelta, timezone
 import secrets
 
 from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
+from riot_client import _get_champion_map
 from ia import get_ai_response
-from db import init_db, close_db, save_summoner, list_summoners
+from db import init_db, close_db, save_summoner
 from redis_client import (
     init_redis, close_redis,
     get_chat_history, append_chat_messages, clear_chat_history,
     check_and_increment_chat_limit, check_and_increment_search_limit,
     get_chat_limit_status
 )
-from champions_data import CHAMPIONS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
@@ -95,9 +95,9 @@ class SummonerRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     championId: str = Field(..., max_length=50)
-    championName: Optional[str] = None   # deprecated, no se usa
-    championTitle: Optional[str] = None  # deprecated
-    persona: Optional[str] = None        # deprecated
+    championName: Optional[str] = None   # se validará contra el mapa
+    championTitle: Optional[str] = None  # se validará contra el mapa
+    persona: str = Field(..., max_length=500)  # personalidad enviada por el front
     message: str = Field(..., max_length=500)
     puuid: str = Field(..., max_length=100)
     region: str = Field(..., max_length=10)
@@ -107,11 +107,20 @@ class ChatRequest(BaseModel):
 async def startup():
     await init_db()
     await init_redis()
+    # Precargar el mapa de campeones para que esté en caché
+    await _get_champion_map()
 
 @app.on_event("shutdown")
 async def shutdown():
     await close_db()
     await close_redis()
+
+# ==================== Funciones auxiliares ====================
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 # ==================== Endpoints ====================
 @app.get("/health")
@@ -172,27 +181,39 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
         logger.exception("Error interno en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor. Intenta más tarde.")
 
-def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
 @app.post("/api/chat")
 async def chat(
     request: ChatRequest,
     http_request: Request,
-    token_data: tuple = Depends(get_puuid_from_token)
+    token_data: Tuple[str, str] = Depends(get_puuid_from_token)
 ):
     token_puuid, token_region = token_data
     if token_puuid != request.puuid or token_region != request.region:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
 
-    if request.championId not in CHAMPIONS:
-        raise HTTPException(status_code=400, detail="Campeón no soportado")
+    # Validar championId contra el mapa de campeones de Data Dragon
+    champion_map = await _get_champion_map()
+    # champion_map es Dict[int, str] (id numérico -> nombre)
+    try:
+        champ_id_int = int(request.championId)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="championId debe ser un número entero")
+    if champ_id_int not in champion_map:
+        raise HTTPException(status_code=400, detail="Campeón no soportado o ID inválido")
 
-    champion_data = CHAMPIONS[request.championId]
+    # Obtenemos el nombre real del campeón desde el mapa
+    real_name = champion_map[champ_id_int]
+    # Opcional: si el front envió un nombre, podríamos verificar que coincida, pero no es necesario
+    # Forzamos el uso del nombre real para el prompt
+    champion_name = real_name
+    # El título no lo tenemos en el mapa de Data Dragon (solo nombre), así que usamos el del front o un título genérico
+    # Para no depender del front, podemos usar un título por defecto, pero si el front envía uno, podríamos usarlo
+    champion_title = request.championTitle or "Campeón de League of Legends"
 
+    # La personalidad la tomamos del front (ya tiene max_length 500)
+    persona = request.persona
+
+    # Rate limit de chat
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_chat_limit(ip)
     if not allowed:
@@ -205,9 +226,9 @@ async def chat(
     player_info = await get_cached_player_info(request.puuid, request.region)
 
     text = await get_ai_response(
-        champion_name=champion_data["name"],
-        champion_title=champion_data["title"],
-        persona=champion_data["persona"],
+        champion_name=champion_name,
+        champion_title=champion_title,
+        persona=persona,
         history=history,
         message=request.message,
         summoner_name=player_info["name"],
@@ -233,28 +254,40 @@ async def chat_limit(http_request: Request):
 async def chat_history(
     puuid: str = Query(..., max_length=100),
     championId: str = Query(..., max_length=50),
-    token_data: tuple = Depends(get_puuid_from_token)
+    token_data: Tuple[str, str] = Depends(get_puuid_from_token)
 ):
     token_puuid, token_region = token_data
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-    if championId not in CHAMPIONS:
-        raise HTTPException(status_code=400, detail="Campeón no soportado")
+    # Validar championId (opcional, pero recomendado)
+    champion_map = await _get_champion_map()
+    try:
+        if int(championId) not in champion_map:
+            raise HTTPException(status_code=400, detail="Campeón inválido")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="championId debe ser un número")
     return await get_chat_history(puuid, championId)
 
 @app.delete("/api/chat/history")
 async def delete_chat_history(
     puuid: str = Query(..., max_length=100),
     championId: str = Query(..., max_length=50),
-    token_data: tuple = Depends(get_puuid_from_token)
+    token_data: Tuple[str, str] = Depends(get_puuid_from_token)
 ):
     token_puuid, token_region = token_data
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-    if championId not in CHAMPIONS:
-        raise HTTPException(status_code=400, detail="Campeón no soportado")
+    champion_map = await _get_champion_map()
+    try:
+        if int(championId) not in champion_map:
+            raise HTTPException(status_code=400, detail="Campeón inválido")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="championId debe ser un número")
     await clear_chat_history(puuid, championId)
     return {"success": True}
+
+# ========== ENDPOINT /api/summoners ELIMINADO ==========
+# Se eliminó para no filtrar puuids.
 
 if __name__ == "__main__":
     import uvicorn
