@@ -95,8 +95,8 @@ class SummonerRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     championId: str = Field(..., max_length=50)
-    championName: Optional[str] = None   # se validará contra el mapa
-    championTitle: Optional[str] = None  # se validará contra el mapa
+    championName: Optional[str] = None   # se ignora, se obtiene del mapa
+    championTitle: Optional[str] = None  # se ignora o se usa como fallback
     persona: str = Field(..., max_length=500)  # personalidad enviada por el front
     message: str = Field(..., max_length=500)
     puuid: str = Field(..., max_length=100)
@@ -203,15 +203,8 @@ async def chat(
 
     # Obtenemos el nombre real del campeón desde el mapa
     real_name = champion_map[champ_id_int]
-    # Opcional: si el front envió un nombre, podríamos verificar que coincida, pero no es necesario
-    # Forzamos el uso del nombre real para el prompt
-    champion_name = real_name
-    # El título no lo tenemos en el mapa de Data Dragon (solo nombre), así que usamos el del front o un título genérico
-    # Para no depender del front, podemos usar un título por defecto, pero si el front envía uno, podríamos usarlo
+    # Usamos el título del front si viene, sino uno genérico
     champion_title = request.championTitle or "Campeón de League of Legends"
-
-    # La personalidad la tomamos del front (ya tiene max_length 500)
-    persona = request.persona
 
     # Rate limit de chat
     ip = get_client_ip(http_request)
@@ -226,9 +219,9 @@ async def chat(
     player_info = await get_cached_player_info(request.puuid, request.region)
 
     text = await get_ai_response(
-        champion_name=champion_name,
+        champion_name=real_name,
         champion_title=champion_title,
-        persona=persona,
+        persona=request.persona,
         history=history,
         message=request.message,
         summoner_name=player_info["name"],
@@ -259,7 +252,7 @@ async def chat_history(
     token_puuid, token_region = token_data
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-    # Validar championId (opcional, pero recomendado)
+    # Validar championId (opcional)
     champion_map = await _get_champion_map()
     try:
         if int(championId) not in champion_map:
