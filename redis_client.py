@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 
 import redis.asyncio as redis
@@ -10,11 +10,14 @@ logger = logging.getLogger(__name__)
 
 _redis: Optional[redis.Redis] = None
 
-CHAT_TTL_SECONDS = 30 * 60  # 30 minutos de inactividad y se borra
-MAX_HISTORY_MESSAGES = 20   # tope de mensajes guardados por chat
+CHAT_TTL_SECONDS = 30 * 60  # 30 minutos
+MAX_HISTORY_MESSAGES = 20
 
 CHAT_RATE_LIMIT_MAX = 10
-CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60 # margen extra sobre 24h para no cortar justo a la medianoche
+CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60
+
+SEARCH_RATE_LIMIT_MAX = 20
+SEARCH_RATE_LIMIT_TTL_SECONDS = 24 * 60 * 60
 
 async def init_redis():
     global _redis
@@ -25,16 +28,13 @@ async def init_redis():
     await _redis.ping()
     logger.info("Conexión a Redis establecida")
 
-
 async def close_redis():
     global _redis
     if _redis:
         await _redis.close()
 
-
 def _chat_key(puuid: str, champion_id: str) -> str:
     return f"chat:{puuid}:{champion_id}"
-
 
 async def get_chat_history(puuid: str, champion_id: str) -> List[Dict[str, str]]:
     raw = await _redis.get(_chat_key(puuid, champion_id))
@@ -46,7 +46,6 @@ async def get_chat_history(puuid: str, champion_id: str) -> List[Dict[str, str]]
         logger.exception("Historial corrupto en Redis, se descarta")
         return []
 
-
 async def append_chat_messages(
     puuid: str,
     champion_id: str,
@@ -55,43 +54,36 @@ async def append_chat_messages(
 ) -> None:
     key = _chat_key(puuid, champion_id)
     history = await get_chat_history(puuid, champion_id)
-
     history.append({"role": "user", "text": user_message})
     history.append({"role": "champion", "text": champion_message})
-
-    # Recortamos para no acumular infinito
     history = history[-MAX_HISTORY_MESSAGES:]
-
     await _redis.set(key, json.dumps(history), ex=CHAT_TTL_SECONDS)
-
 
 async def clear_chat_history(puuid: str, champion_id: str) -> None:
     await _redis.delete(_chat_key(puuid, champion_id))
 
-
-def _rate_limit_key(ip: str) -> str:
+def _rate_limit_key(ip: str, prefix: str) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"ratelimit:chat:{ip}:{today}"
+    return f"ratelimit:{prefix}:{ip}:{today}"
 
-async def check_and_increment_chat_limit(ip: str) -> tuple[bool, int]:
+async def check_and_increment_rate_limit(ip: str, prefix: str, max_requests: int, ttl_seconds: int) -> Tuple[bool, int]:
     """
-    Incrementa el contador de chats del día para esta IP.
+    Incrementa el contador de solicitudes para esta IP y prefix.
     Devuelve (permitido, usados_hasta_ahora).
     """
-    key = _rate_limit_key(ip)
+    key = _rate_limit_key(ip, prefix)
     current = await _redis.incr(key)
     if current == 1:
-        # Solo seteamos el TTL la primera vez que se crea la key
-        await _redis.expire(key, CHAT_RATE_LIMIT_TTL_SECONDS)
-
-    if current > CHAT_RATE_LIMIT_MAX:
+        await _redis.expire(key, ttl_seconds)
+    if current > max_requests:
         return False, current
     return True, current
 
+async def check_and_increment_chat_limit(ip: str) -> Tuple[bool, int]:
+    return await check_and_increment_rate_limit(ip, "chat", CHAT_RATE_LIMIT_MAX, CHAT_RATE_LIMIT_TTL_SECONDS)
 
 async def get_chat_limit_status(ip: str) -> Dict[str, int]:
-    """Para que el frontend pueda mostrar cuántos mensajes quedan, sin consumir cupo."""
-    key = _rate_limit_key(ip)
+    key = _rate_limit_key(ip, "chat")
     raw = await _redis.get(key)
     used = int(raw) if raw else 0
     return {
@@ -99,3 +91,6 @@ async def get_chat_limit_status(ip: str) -> Dict[str, int]:
         "limit": CHAT_RATE_LIMIT_MAX,
         "remaining": max(0, CHAT_RATE_LIMIT_MAX - used),
     }
+
+async def check_and_increment_search_limit(ip: str) -> Tuple[bool, int]:
+    return await check_and_increment_rate_limit(ip, "search", SEARCH_RATE_LIMIT_MAX, SEARCH_RATE_LIMIT_TTL_SECONDS)

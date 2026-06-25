@@ -1,29 +1,108 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+import jwt
+from datetime import datetime, timedelta, timezone
+import secrets
+
 from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
 from ia import get_ai_response
 from db import init_db, close_db, save_summoner, list_summoners
-from redis_client import init_redis, close_redis, get_chat_history, append_chat_messages
-
+from redis_client import (
+    init_redis, close_redis,
+    get_chat_history, append_chat_messages, clear_chat_history,
+    check_and_increment_chat_limit, check_and_increment_search_limit,
+    get_chat_limit_status
+)
+from champions_data import CHAMPIONS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
 
 app = FastAPI(title="AI Chat Backend", version="1.0.0")
 
+# ==================== CORS ====================
+ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://chatwithyourmain.andresrosalez.dev").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # No usamos cookies ni sesiones
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ==================== Security Headers ====================
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data: https://ddragon.leagueoflegends.com; "
+        "connect-src 'self' https://ddragon.leagueoflegends.com; "
+        "frame-ancestors 'none';"
+    )
+    return response
 
+# ==================== JWT ====================
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    logger.warning("JWT_SECRET no configurada, usando valor aleatorio (no recomendado para producción)")
+    JWT_SECRET = secrets.token_urlsafe(32)
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_MINUTES = 60 * 24  # 24 horas
+
+def create_token(puuid: str, region: str) -> str:
+    payload = {
+        "puuid": puuid,
+        "region": region,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRATION_MINUTES),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+async def get_puuid_from_token(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+    token = credentials.credentials
+    payload = decode_token(token)
+    puuid = payload.get("puuid")
+    region = payload.get("region")
+    if not puuid or not region:
+        raise HTTPException(status_code=401, detail="Token mal formado")
+    return puuid, region
+
+# ==================== Modelos ====================
+class SummonerRequest(BaseModel):
+    summoner_name: str = Field(..., max_length=100, description="Riot ID completo, ej. Nombre#TAG")
+    region: str = Field(..., max_length=10)
+
+class ChatRequest(BaseModel):
+    championId: str = Field(..., max_length=50)
+    championName: Optional[str] = None   # deprecated, no se usa
+    championTitle: Optional[str] = None  # deprecated
+    persona: Optional[str] = None        # deprecated
+    message: str = Field(..., max_length=500)
+    puuid: str = Field(..., max_length=100)
+    region: str = Field(..., max_length=10)
+
+# ==================== Eventos ====================
 @app.on_event("startup")
 async def startup():
     await init_db()
@@ -33,54 +112,39 @@ async def startup():
 async def shutdown():
     await close_db()
     await close_redis()
-# =========================
-# Modelos
-# =========================
 
-
-class SummonerRequest(BaseModel):
-    summoner_name: str
-    region: str
-
-
-class ChatHistoryItem(BaseModel):
-    role: str  # "user" | "champion"
-    text: str
-
-class ChatRequest(BaseModel):
-    championId: str
-    championName: str
-    championTitle: str
-    persona: str
-    message: str
-    puuid: str
-    region: str
-
-# =========================
-# Endpoints
-# =========================
+# ==================== Endpoints ====================
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 @app.post("/api/summoner")
-async def post_summoner(request: SummonerRequest):
-    return await _handle_summoner(request.summoner_name, request.region)
+async def post_summoner(request: SummonerRequest, http_request: Request):
+    return await _handle_summoner(request.summoner_name, request.region, http_request)
 
 @app.get("/api/summoner")
 async def get_summoner(
-    summoner_name: str = Query(..., description="Riot ID completo, ej. Nombre#TAG"),
-    region: str = Query(..., description="Región (LAN, NA, EUW, ...)")
+    summoner_name: str = Query(..., max_length=100, description="Riot ID completo, ej. Nombre#TAG"),
+    region: str = Query(..., max_length=10),
+    http_request: Request = None
 ):
-    return await _handle_summoner(summoner_name, region)
+    return await _handle_summoner(summoner_name, region, http_request)
 
-async def _handle_summoner(summoner_name: str, region: str):
+async def _handle_summoner(summoner_name: str, region: str, http_request: Request):
+    # Rate limit por IP (búsquedas)
+    ip = get_client_ip(http_request)
+    allowed, used = await check_and_increment_search_limit(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Has excedido el límite de búsquedas de invocadores por hoy. Vuelve mañana."
+        )
+
     try:
         if region not in REGION_MAP:
             raise HTTPException(status_code=400, detail="Región no soportada")
         result = await get_summoner_and_mastery(summoner_name, region)
 
-        # Guardamos/actualizamos el summoner en la base
         await save_summoner(
             puuid=result["puuid"],
             game_name=result["name"],
@@ -90,31 +154,44 @@ async def _handle_summoner(summoner_name: str, region: str):
             level=result["level"],
         )
 
+        # Generar token JWT para este puuid
+        token = create_token(result["puuid"], region)
+        result["token"] = token
         return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+
+    except ValueError:
+        logger.warning(f"Error de usuario: invocador no encontrado para {summoner_name} en {region}")
+        raise HTTPException(status_code=404, detail="Invocador no encontrado. Verifica el Riot ID y la región.")
+    except PermissionError:
+        logger.warning(f"Error de permiso en Riot API para {summoner_name}")
+        raise HTTPException(status_code=403, detail="Error con la clave API. Contacta al soporte.")
+    except RuntimeError:
+        logger.exception(f"Error de Riot API para {summoner_name}")
+        raise HTTPException(status_code=429, detail="Demasiadas peticiones a Riot. Espera un momento e intenta de nuevo.")
     except Exception:
-        logger.exception("Error en /api/summoner")
-        raise HTTPException(status_code=500, detail="Error interno del servidor")
+        logger.exception("Error interno en /api/summoner")
+        raise HTTPException(status_code=500, detail="Error interno del servidor. Intenta más tarde.")
 
 def get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        # El primer valor es el cliente original; los siguientes son proxies intermedios
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest, http_request: Request):
-    if not request.message.strip():
-        raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío")
+async def chat(
+    request: ChatRequest,
+    http_request: Request,
+    token_data: tuple = Depends(get_puuid_from_token)
+):
+    token_puuid, token_region = token_data
+    if token_puuid != request.puuid or token_region != request.region:
+        raise HTTPException(status_code=403, detail="No autorizado para este puuid")
 
-    if request.region not in REGION_MAP:
-        raise HTTPException(status_code=400, detail="Región no soportada")
+    if request.championId not in CHAMPIONS:
+        raise HTTPException(status_code=400, detail="Campeón no soportado")
+
+    champion_data = CHAMPIONS[request.championId]
 
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_chat_limit(ip)
@@ -128,9 +205,9 @@ async def chat(request: ChatRequest, http_request: Request):
     player_info = await get_cached_player_info(request.puuid, request.region)
 
     text = await get_ai_response(
-        champion_name=request.championName,
-        champion_title=request.championTitle,
-        persona=request.persona,
+        champion_name=champion_data["name"],
+        champion_title=champion_data["title"],
+        persona=champion_data["persona"],
         history=history,
         message=request.message,
         summoner_name=player_info["name"],
@@ -151,16 +228,31 @@ async def chat_limit(http_request: Request):
     ip = get_client_ip(http_request)
     return await get_chat_limit_status(ip)
 
-@app.get("/api/summoners")
-async def get_summoners(limit: int = 50):
-    return await list_summoners(limit)
-    
+# ========== HISTORIAL (protegido con token) ==========
 @app.get("/api/chat/history")
-async def chat_history(puuid: str, championId: str):
+async def chat_history(
+    puuid: str = Query(..., max_length=100),
+    championId: str = Query(..., max_length=50),
+    token_data: tuple = Depends(get_puuid_from_token)
+):
+    token_puuid, token_region = token_data
+    if token_puuid != puuid:
+        raise HTTPException(status_code=403, detail="No autorizado para este puuid")
+    if championId not in CHAMPIONS:
+        raise HTTPException(status_code=400, detail="Campeón no soportado")
     return await get_chat_history(puuid, championId)
 
 @app.delete("/api/chat/history")
-async def delete_chat_history(puuid: str, championId: str):
+async def delete_chat_history(
+    puuid: str = Query(..., max_length=100),
+    championId: str = Query(..., max_length=50),
+    token_data: tuple = Depends(get_puuid_from_token)
+):
+    token_puuid, token_region = token_data
+    if token_puuid != puuid:
+        raise HTTPException(status_code=403, detail="No autorizado para este puuid")
+    if championId not in CHAMPIONS:
+        raise HTTPException(status_code=400, detail="Campeón no soportado")
     await clear_chat_history(puuid, championId)
     return {"success": True}
 
