@@ -53,16 +53,16 @@ async def add_security_headers(request: Request, call_next):
     )
     return response
 
-# ==================== JWT ====================
+# ==================== JWT (solo para historial) ====================
 JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
-    logger.warning("JWT_SECRET no configurada, usando valor aleatorio (no recomendado para producción)")
+    logger.warning("JWT_SECRET no configurada, usando valor aleatorio")
     JWT_SECRET = secrets.token_urlsafe(32)
 else:
     logger.info("JWT_SECRET configurada desde entorno")
 
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_MINUTES = 60 * 24  # 24 horas
+JWT_EXPIRATION_MINUTES = 60 * 24
 
 def create_token(puuid: str, region: str) -> str:
     payload = {
@@ -71,32 +71,23 @@ def create_token(puuid: str, region: str) -> str:
         "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRATION_MINUTES),
         "iat": datetime.now(timezone.utc),
     }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    logger.info(f"Token generado para puuid {puuid[:8]}...")
-    return token
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def decode_token(token: str) -> dict:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        logger.info(f"Token decodificado correctamente: puuid={payload.get('puuid')}")
-        return payload
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
-        logger.warning("Token expirado")
         raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.InvalidTokenError as e:
-        logger.warning(f"Token inválido: {e}")
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido")
 
 async def get_puuid_from_token(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     token = credentials.credentials
-    logger.info(f"Token recibido (primeros 20 chars): {token[:20]}...")
     payload = decode_token(token)
     puuid = payload.get("puuid")
     region = payload.get("region")
     if not puuid or not region:
-        logger.error("Token mal formado: faltan puuid o region")
         raise HTTPException(status_code=401, detail="Token mal formado")
-    logger.info(f"Token válido para puuid={puuid[:8]}... region={region}")
     return puuid, region
 
 # ==================== Modelos ====================
@@ -172,6 +163,7 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
             level=result["level"],
         )
 
+        # Generar token JWT (se devuelve pero no se usa en /api/chat)
         token = create_token(result["puuid"], region)
         result["token"] = token
         return result
@@ -189,19 +181,15 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
         logger.exception("Error interno en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor. Intenta más tarde.")
 
+# ==================== /api/chat SIN AUTENTICACIÓN JWT ====================
 @app.post("/api/chat")
 async def chat(
     request: ChatRequest,
     http_request: Request,
-    token_data: Tuple[str, str] = Depends(get_puuid_from_token)
 ):
-    token_puuid, token_region = token_data
     logger.info(f"Chat request para puuid={request.puuid[:8]}... region={request.region}")
 
-    if token_puuid != request.puuid or token_region != request.region:
-        logger.warning(f"Token mismatch: token puuid={token_puuid[:8]} vs request puuid={request.puuid[:8]}")
-        raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-
+    # Validar championId contra el mapa de Data Dragon
     champion_map = await _get_champion_map()
     try:
         champ_id_int = int(request.championId)
@@ -213,6 +201,7 @@ async def chat(
     real_name = champion_map[champ_id_int]
     champion_title = request.championTitle or "Campeón de League of Legends"
 
+    # Rate limit de chat
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_chat_limit(ip)
     if not allowed:
@@ -248,6 +237,7 @@ async def chat_limit(http_request: Request):
     ip = get_client_ip(http_request)
     return await get_chat_limit_status(ip)
 
+# ==================== Historial (protegido con JWT) ====================
 @app.get("/api/chat/history")
 async def chat_history(
     puuid: str = Query(..., max_length=100),
@@ -282,6 +272,8 @@ async def delete_chat_history(
         raise HTTPException(status_code=400, detail="championId debe ser un número")
     await clear_chat_history(puuid, championId)
     return {"success": True}
+
+# ========== ENDPOINT /api/summoners ELIMINADO ==========
 
 if __name__ == "__main__":
     import uvicorn
