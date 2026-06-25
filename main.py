@@ -1,6 +1,6 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -63,11 +63,9 @@ class ChatRequest(BaseModel):
 async def health():
     return {"status": "ok"}
 
-
 @app.post("/api/summoner")
 async def post_summoner(request: SummonerRequest):
     return await _handle_summoner(request.summoner_name, request.region)
-
 
 @app.get("/api/summoner")
 async def get_summoner(
@@ -75,7 +73,6 @@ async def get_summoner(
     region: str = Query(..., description="Región (LAN, NA, EUW, ...)")
 ):
     return await _handle_summoner(summoner_name, region)
-
 
 async def _handle_summoner(summoner_name: str, region: str):
     try:
@@ -104,19 +101,30 @@ async def _handle_summoner(summoner_name: str, region: str):
         logger.exception("Error en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
 
-
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # El primer valor es el cliente original; los siguientes son proxies intermedios
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, http_request: Request):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío")
 
     if request.region not in REGION_MAP:
         raise HTTPException(status_code=400, detail="Región no soportada")
 
-    # Historial desde Redis en vez del front
-    history = await get_chat_history(request.puuid, request.championId)
+    ip = get_client_ip(http_request)
+    allowed, used = await check_and_increment_chat_limit(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Llegaste al límite de 10 mensajes por día en esta demo. Probá de nuevo mañana.",
+        )
 
+    history = await get_chat_history(request.puuid, request.championId)
     player_info = await get_cached_player_info(request.puuid, request.region)
 
     text = await get_ai_response(
@@ -129,7 +137,6 @@ async def chat(request: ChatRequest):
         player_context=player_info["context"],
     )
 
-    # Guardamos el intercambio en Redis (con su TTL)
     await append_chat_messages(
         puuid=request.puuid,
         champion_id=request.championId,
@@ -137,8 +144,13 @@ async def chat(request: ChatRequest):
         champion_message=text,
     )
 
-    return {"text": text}
-    
+    return {"text": text, "remaining": max(0, 10 - used)}
+
+@app.get("/api/chat/limit")
+async def chat_limit(http_request: Request):
+    ip = get_client_ip(http_request)
+    return await get_chat_limit_status(ip)
+
 @app.get("/api/summoners")
 async def get_summoners(limit: int = 50):
     return await list_summoners(limit)
@@ -146,7 +158,6 @@ async def get_summoners(limit: int = 50):
 @app.get("/api/chat/history")
 async def chat_history(puuid: str, championId: str):
     return await get_chat_history(puuid, championId)
-
 
 @app.delete("/api/chat/history")
 async def delete_chat_history(puuid: str, championId: str):
