@@ -96,7 +96,7 @@ class SummonerRequest(BaseModel):
     region: str = Field(..., max_length=10)
 
 class ChatRequest(BaseModel):
-    championId: str = Field(..., max_length=50)
+    championId: str = Field(..., max_length=50)   # Puede ser nombre ("Ahri") o ID numérico ("1")
     championName: Optional[str] = None
     championTitle: Optional[str] = None
     persona: str = Field(..., max_length=500)
@@ -109,6 +109,7 @@ class ChatRequest(BaseModel):
 async def startup():
     await init_db()
     await init_redis()
+    # Precargar mapa de campeones
     await _get_champion_map()
 
 @app.on_event("shutdown")
@@ -122,6 +123,30 @@ def get_client_ip(request: Request) -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+async def _resolve_champion_id(champion_id: str) -> Tuple[int, str]:
+    """
+    Resuelve championId (puede ser nombre "Ahri" o ID numérico "1")
+    Devuelve (id_numérico, nombre_real)
+    """
+    champion_map = await _get_champion_map()  # {int: nombre}
+    # Invertimos el mapa para búsqueda por nombre
+    name_to_id = {nombre: id_num for id_num, nombre in champion_map.items()}
+    
+    # Intentar como entero
+    try:
+        num_id = int(champion_id)
+        if num_id in champion_map:
+            return num_id, champion_map[num_id]
+    except ValueError:
+        pass
+    
+    # Intentar como nombre
+    if champion_id in name_to_id:
+        num_id = name_to_id[champion_id]
+        return num_id, champion_id
+    
+    raise ValueError(f"Campeón no válido: {champion_id}")
 
 # ==================== Endpoints ====================
 @app.get("/health")
@@ -163,7 +188,7 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
             level=result["level"],
         )
 
-        # Generar token JWT (se devuelve pero no se usa en /api/chat)
+        # Token (se devuelve aunque no se use en /api/chat)
         token = create_token(result["puuid"], region)
         result["token"] = token
         return result
@@ -189,16 +214,11 @@ async def chat(
 ):
     logger.info(f"Chat request para puuid={request.puuid[:8]}... region={request.region}")
 
-    # Validar championId contra el mapa de Data Dragon
-    champion_map = await _get_champion_map()
     try:
-        champ_id_int = int(request.championId)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="championId debe ser un número entero")
-    if champ_id_int not in champion_map:
-        raise HTTPException(status_code=400, detail="Campeón no soportado o ID inválido")
+        champ_id_int, real_name = await _resolve_champion_id(request.championId)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    real_name = champion_map[champ_id_int]
     champion_title = request.championTitle or "Campeón de League of Legends"
 
     # Rate limit de chat
@@ -247,12 +267,10 @@ async def chat_history(
     token_puuid, token_region = token_data
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-    champion_map = await _get_champion_map()
     try:
-        if int(championId) not in champion_map:
-            raise HTTPException(status_code=400, detail="Campeón inválido")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="championId debe ser un número")
+        await _resolve_champion_id(championId)  # solo para validar que existe
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return await get_chat_history(puuid, championId)
 
 @app.delete("/api/chat/history")
@@ -264,12 +282,10 @@ async def delete_chat_history(
     token_puuid, token_region = token_data
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
-    champion_map = await _get_champion_map()
     try:
-        if int(championId) not in champion_map:
-            raise HTTPException(status_code=400, detail="Campeón inválido")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="championId debe ser un número")
+        await _resolve_champion_id(championId)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     await clear_chat_history(puuid, championId)
     return {"success": True}
 
