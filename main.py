@@ -14,6 +14,7 @@ from riot_client import _get_champion_map
 from ia import get_ai_response
 from db import init_db, close_db, save_summoner
 from redis_client import (
+    init_redis, close_redis,  
     get_chat_history, append_chat_messages, clear_chat_history,
     check_and_increment_chat_limit, check_and_increment_search_limit,
     get_chat_limit_status
@@ -29,19 +30,10 @@ ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://chatw
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
+    allow_credentials=False,   # o True si necesitas cookies, pero no es el caso
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ==================== Security Headers ====================
-@app.middleware("http")
-async def cors_middleware(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "https://chatwithyourmain.andresrosalez.dev"
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
 
 # ==================== JWT (solo para historial) ====================
 JWT_SECRET = os.getenv("JWT_SECRET")
@@ -98,6 +90,7 @@ class ChatRequest(BaseModel):
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await init_redis() 
     await _get_champion_map()
 
 @app.on_event("shutdown")
