@@ -15,14 +15,11 @@ from riot_client import _get_champion_map
 from ia import get_ai_response
 from db import init_db, close_db, save_summoner
 from redis_client import (
-    init_redis, close_redis,  
+    init_redis, close_redis,
     get_chat_history, append_chat_messages, clear_chat_history,
     check_and_increment_chat_limit, check_and_increment_search_limit,
     get_chat_limit_status
 )
-
-_chat_limit_cache = {} 
-CHAT_LIMIT_CACHE_TTL = 5 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
@@ -34,7 +31,7 @@ ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://chatw
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,   # o True si necesitas cookies, pero no es el caso
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -82,7 +79,7 @@ class SummonerRequest(BaseModel):
     region: str = Field(..., max_length=10)
 
 class ChatRequest(BaseModel):
-    championId: str = Field(..., max_length=50)   
+    championId: str = Field(..., max_length=50)
     championName: Optional[str] = None
     championTitle: Optional[str] = None
     persona: str = Field(..., max_length=500)
@@ -94,7 +91,7 @@ class ChatRequest(BaseModel):
 @app.on_event("startup")
 async def startup():
     await init_db()
-    await init_redis() 
+    await init_redis()
     await _get_champion_map()
 
 @app.on_event("shutdown")
@@ -110,27 +107,17 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 async def _resolve_champion_id(champion_id: str) -> Tuple[int, str]:
-    """
-    Resuelve championId (puede ser nombre "Ahri" o ID numérico "1")
-    Devuelve (id_numérico, nombre_real)
-    """
     champion_map = await _get_champion_map()  # {int: nombre}
-    # Invertimos el mapa para búsqueda por nombre
     name_to_id = {nombre: id_num for id_num, nombre in champion_map.items()}
-    
-    # Intentar como entero
     try:
         num_id = int(champion_id)
         if num_id in champion_map:
             return num_id, champion_map[num_id]
     except ValueError:
         pass
-    
-    # Intentar como nombre
     if champion_id in name_to_id:
         num_id = name_to_id[champion_id]
         return num_id, champion_id
-    
     raise ValueError(f"Campeón no válido: {champion_id}")
 
 # ==================== Endpoints ====================
@@ -173,7 +160,6 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
             level=result["level"],
         )
 
-        # Token (se devuelve aunque no se use en /api/chat)
         token = create_token(result["puuid"], region)
         result["token"] = token
         return result
@@ -206,7 +192,7 @@ async def chat(
 
     champion_title = request.championTitle or "Campeón de League of Legends"
 
-    # Rate limit de chat
+    # Rate limit de chat (con caché en memoria)
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_chat_limit(ip)
     if not allowed:
@@ -240,13 +226,8 @@ async def chat(
 @app.get("/api/chat/limit")
 async def chat_limit(http_request: Request):
     ip = get_client_ip(http_request)
-    now = time()
-    if ip in _chat_limit_cache and now - _chat_limit_cache[ip][0] < CHAT_LIMIT_CACHE_TTL:
-        used = _chat_limit_cache[ip][1]
-        return {"used": used, "limit": CHAT_RATE_LIMIT_MAX, "remaining": max(0, CHAT_RATE_LIMIT_MAX - used)}
-    
+    # Usa la función mejorada que también cachea en memoria
     status = await get_chat_limit_status(ip)
-    _chat_limit_cache[ip] = (now, status["used"])
     return status
 
 # ==================== Historial (protegido con JWT) ====================
@@ -260,7 +241,7 @@ async def chat_history(
     if token_puuid != puuid:
         raise HTTPException(status_code=403, detail="No autorizado para este puuid")
     try:
-        await _resolve_champion_id(championId)  # solo para validar que existe
+        await _resolve_champion_id(championId)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return await get_chat_history(puuid, championId)
@@ -280,8 +261,6 @@ async def delete_chat_history(
         raise HTTPException(status_code=400, detail=str(e))
     await clear_chat_history(puuid, championId)
     return {"success": True}
-
-# ========== ENDPOINT /api/summoners ELIMINADO ==========
 
 if __name__ == "__main__":
     import uvicorn
