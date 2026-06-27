@@ -14,7 +14,6 @@ from riot_client import _get_champion_map
 from ia import get_ai_response
 from db import init_db, close_db, save_summoner
 from redis_client import (
-    init_redis, close_redis,
     get_chat_history, append_chat_messages, clear_chat_history,
     check_and_increment_chat_limit, check_and_increment_search_limit,
     get_chat_limit_status
@@ -108,8 +107,6 @@ class ChatRequest(BaseModel):
 @app.on_event("startup")
 async def startup():
     await init_db()
-    await init_redis()
-    # Precargar mapa de campeones
     await _get_champion_map()
 
 @app.on_event("shutdown")

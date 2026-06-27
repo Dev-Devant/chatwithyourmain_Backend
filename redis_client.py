@@ -8,7 +8,7 @@ import redis.asyncio as redis
 
 logger = logging.getLogger(__name__)
 
-_redis: Optional[redis.Redis] = None
+# No guardamos conexión global.
 
 CHAT_TTL_SECONDS = 30 * 60  # 30 minutos
 MAX_HISTORY_MESSAGES = 20
@@ -19,25 +19,22 @@ CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60
 SEARCH_RATE_LIMIT_MAX = 20
 SEARCH_RATE_LIMIT_TTL_SECONDS = 24 * 60 * 60
 
-async def init_redis():
-    global _redis
-    redis_url = os.getenv("REDIS_URL")
-    if not redis_url:
-        logger.warning("REDIS_URL no configurada")
-    _redis = redis.from_url(redis_url, decode_responses=True)
-    await _redis.ping()
-    logger.info("Conexión a Redis establecida")
+def _get_redis_url() -> str:
+    url = os.getenv("REDIS_URL")
+    if not url:
+        raise RuntimeError("REDIS_URL no configurada")
+    return url
 
-async def close_redis():
-    global _redis
-    if _redis:
-        await _redis.close()
+# Funciones auxiliares que abren y cierran conexión cada vez
 
-def _chat_key(puuid: str, champion_id: str) -> str:
-    return f"chat:{puuid}:{champion_id}"
+async def _get_redis_client():
+    """Devuelve un cliente Redis que se conecta bajo demanda."""
+    return redis.from_url(_get_redis_url(), decode_responses=True)
 
 async def get_chat_history(puuid: str, champion_id: str) -> List[Dict[str, str]]:
-    raw = await _redis.get(_chat_key(puuid, champion_id))
+    key = f"chat:{puuid}:{champion_id}"
+    async with await _get_redis_client() as client:
+        raw = await client.get(key)
     if not raw:
         return []
     try:
@@ -52,40 +49,47 @@ async def append_chat_messages(
     user_message: str,
     champion_message: str,
 ) -> None:
-    key = _chat_key(puuid, champion_id)
-    history = await get_chat_history(puuid, champion_id)
-    history.append({"role": "user", "text": user_message})
-    history.append({"role": "champion", "text": champion_message})
-    history = history[-MAX_HISTORY_MESSAGES:]
-    await _redis.set(key, json.dumps(history), ex=CHAT_TTL_SECONDS)
+    key = f"chat:{puuid}:{champion_id}"
+    async with await _get_redis_client() as client:
+        raw = await client.get(key)
+        history = []
+        if raw:
+            try:
+                history = json.loads(raw)
+            except json.JSONDecodeError:
+                history = []
+        history.append({"role": "user", "text": user_message})
+        history.append({"role": "champion", "text": champion_message})
+        history = history[-MAX_HISTORY_MESSAGES:]
+        await client.set(key, json.dumps(history), ex=CHAT_TTL_SECONDS)
 
 async def clear_chat_history(puuid: str, champion_id: str) -> None:
-    await _redis.delete(_chat_key(puuid, champion_id))
+    key = f"chat:{puuid}:{champion_id}"
+    async with await _get_redis_client() as client:
+        await client.delete(key)
 
 def _rate_limit_key(ip: str, prefix: str) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return f"ratelimit:{prefix}:{ip}:{today}"
 
 async def check_and_increment_rate_limit(ip: str, prefix: str, max_requests: int, ttl_seconds: int) -> Tuple[bool, int]:
-    """
-    Incrementa el contador de solicitudes para esta IP y prefix.
-    Devuelve (permitido, usados_hasta_ahora).
-    """
     key = _rate_limit_key(ip, prefix)
-    current = await _redis.incr(key)
-    if current == 1:
-        await _redis.expire(key, ttl_seconds)
-    if current > max_requests:
-        return False, current
-    return True, current
+    async with await _get_redis_client() as client:
+        current = await client.incr(key)
+        if current == 1:
+            await client.expire(key, ttl_seconds)
+        if current > max_requests:
+            return False, current
+        return True, current
 
 async def check_and_increment_chat_limit(ip: str) -> Tuple[bool, int]:
     return await check_and_increment_rate_limit(ip, "chat", CHAT_RATE_LIMIT_MAX, CHAT_RATE_LIMIT_TTL_SECONDS)
 
 async def get_chat_limit_status(ip: str) -> Dict[str, int]:
     key = _rate_limit_key(ip, "chat")
-    raw = await _redis.get(key)
-    used = int(raw) if raw else 0
+    async with await _get_redis_client() as client:
+        raw = await client.get(key)
+        used = int(raw) if raw else 0
     return {
         "used": min(used, CHAT_RATE_LIMIT_MAX),
         "limit": CHAT_RATE_LIMIT_MAX,
