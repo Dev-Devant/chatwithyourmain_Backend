@@ -22,22 +22,13 @@ SEARCH_RATE_LIMIT_TTL_SECONDS = 24 * 60 * 60
 # ========== INICIALIZACIÓN ==========
 
 async def init_redis():
-    """Inicializa la conexión a Redis."""
     global _redis
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         raise RuntimeError("REDIS_URL no configurada")
-    _redis = redis.from_url(
-    redis_url,
-    decode_responses=True,
-    socket_keepalive=True,
-    socket_keepalive_options={
-        1: 30,   # TCP_KEEPIDLE (segundos)
-        2: 10,   # TCP_KEEPINTVL
-        3: 5     # TCP_KEEPCNT
-    }
-)
-    await _redis.ping()
+    # SOLO la conexión, sin ningún tipo de latido o keepalive extra
+    _redis = redis.from_url(redis_url, decode_responses=True)
+    await _redis.ping()  # Déjalo para verificar que la contraseña/URL es correcta al inicio
     logger.info("Conexión a Redis establecida")
     return _redis
 
