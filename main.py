@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import jwt
 from datetime import datetime, timedelta, timezone
 import secrets
+from time import time
 
 from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
 from riot_client import _get_champion_map
@@ -19,6 +20,9 @@ from redis_client import (
     check_and_increment_chat_limit, check_and_increment_search_limit,
     get_chat_limit_status
 )
+
+_chat_limit_cache = {} 
+CHAT_LIMIT_CACHE_TTL = 5 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
@@ -78,7 +82,7 @@ class SummonerRequest(BaseModel):
     region: str = Field(..., max_length=10)
 
 class ChatRequest(BaseModel):
-    championId: str = Field(..., max_length=50)   # Puede ser nombre ("Ahri") o ID numérico ("1")
+    championId: str = Field(..., max_length=50)   
     championName: Optional[str] = None
     championTitle: Optional[str] = None
     persona: str = Field(..., max_length=500)
@@ -236,7 +240,14 @@ async def chat(
 @app.get("/api/chat/limit")
 async def chat_limit(http_request: Request):
     ip = get_client_ip(http_request)
-    return await get_chat_limit_status(ip)
+    now = time()
+    if ip in _chat_limit_cache and now - _chat_limit_cache[ip][0] < CHAT_LIMIT_CACHE_TTL:
+        used = _chat_limit_cache[ip][1]
+        return {"used": used, "limit": CHAT_RATE_LIMIT_MAX, "remaining": max(0, CHAT_RATE_LIMIT_MAX - used)}
+    
+    status = await get_chat_limit_status(ip)
+    _chat_limit_cache[ip] = (now, status["used"])
+    return status
 
 # ==================== Historial (protegido con JWT) ====================
 @app.get("/api/chat/history")

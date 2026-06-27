@@ -27,7 +27,16 @@ async def init_redis():
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         raise RuntimeError("REDIS_URL no configurada")
-    _redis = redis.from_url(redis_url, decode_responses=True)
+    _redis = redis.from_url(
+    redis_url,
+    decode_responses=True,
+    socket_keepalive=True,
+    socket_keepalive_options={
+        1: 30,   # TCP_KEEPIDLE (segundos)
+        2: 10,   # TCP_KEEPINTVL
+        3: 5     # TCP_KEEPCNT
+    }
+)
     await _redis.ping()
     logger.info("Conexión a Redis establecida")
     return _redis

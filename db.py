@@ -19,7 +19,13 @@ async def init_db():
         min_size=1,
         max_size=10,
         command_timeout=10,
-        timeout=10
+        timeout=10,
+
+        server_settings={
+            'tcp_keepalives_idle': '30',
+            'tcp_keepalives_interval': '10',
+            'tcp_keepalives_count': '5'
+        }
     )
 
     await _ensure_schema()
