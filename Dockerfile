@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 8000
 
 # Comando de inicio - usamos uvicorn con un solo worker para serverless
-CMD ["gunicorn", "main:app", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "--timeout", "60", "--bind", "0.0.0.0:8000"]
+CMD ["sh", "-c", "gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --timeout 60 --bind 0.0.0.0:$PORT"]
