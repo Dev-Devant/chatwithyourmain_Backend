@@ -14,13 +14,13 @@ CHAT_TTL_SECONDS = 30 * 60          # 30 minutos para historial
 MAX_HISTORY_MESSAGES = 20
 
 CHAT_RATE_LIMIT_MAX = 10
-CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60   # 26 horas (para cubrir un día)
+CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60   # 26 horas
 
 SEARCH_RATE_LIMIT_MAX = 20
 SEARCH_RATE_LIMIT_TTL_SECONDS = 24 * 60 * 60
 
 
-# ========== INICIALIZACIÓN con keepalive ==========
+# ========== INICIALIZACIÓN sin opciones problemáticas ==========
 
 async def init_redis():
     global _redis
@@ -28,24 +28,18 @@ async def init_redis():
     if not redis_url:
         raise RuntimeError("REDIS_URL no configurada")
 
-    # Configuración robusta: keepalive, timeouts, reintentos
     _redis = redis.from_url(
         redis_url,
         decode_responses=True,
-        socket_keepalive=True,
-        socket_keepalive_options={
-            1: 30,   # TCP_KEEPIDLE (segundos)
-            2: 10,   # TCP_KEEPINTVL
-            3: 3     # TCP_KEEPCNT
-        },
-        socket_timeout=5,
-        retry_on_timeout=True,
-        health_check_interval=30,
+        socket_keepalive=True,         # Activa keepalive (usa valores por defecto del sistema)
+        socket_timeout=5,              # Timeout para operaciones
+        retry_on_timeout=True,         # Reintentar si timeout
+        health_check_interval=30,      # Ping periódico para mantener viva la conexión
         max_connections=20,
     )
 
     await _redis.ping()
-    logger.info("Conexión a Redis establecida con keepalive")
+    logger.info("Conexión a Redis establecida")
 
 
 async def close_redis():
@@ -102,9 +96,6 @@ async def clear_chat_history(puuid: str, champion_id: str) -> None:
 
 # ========== RATE LIMIT con script Lua (una sola llamada) ==========
 
-# Script Lua: incrementa y devuelve el contador, además pone expire si es nueva clave.
-# Recibe: KEYS[1] = clave, ARGV[1] = TTL en segundos, ARGV[2] = límite máximo.
-# Devuelve: [contador, excedido?] (excedido = 1 si contador > límite)
 RATE_LIMIT_LUA = """
     local key = KEYS[1]
     local ttl = tonumber(ARGV[1])
@@ -120,9 +111,7 @@ RATE_LIMIT_LUA = """
     return {current, exceeded}
 """
 
-# Registrar el script al iniciar (se hará una sola vez)
 _LUA_RATE_LIMIT = None
-
 
 async def _get_rate_limit_script():
     global _LUA_RATE_LIMIT
@@ -136,9 +125,7 @@ async def _get_rate_limit_script():
 async def check_and_increment_rate_limit(
     ip: str, prefix: str, max_requests: int, ttl_seconds: int
 ) -> Tuple[bool, int]:
-    """Devuelve (permitido, contador_actual) usando script Lua en una sola llamada."""
     if not _redis:
-        # Sin Redis, permitir (modo inseguro, solo para desarrollo)
         return True, 0
 
     key = f"ratelimit:{prefix}:{ip}:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
@@ -152,7 +139,6 @@ async def check_and_increment_rate_limit(
         return allowed, current
     except Exception as e:
         logger.exception("Error ejecutando script de rate-limit")
-        # En caso de error, permitimos (pero registramos)
         return True, 0
 
 
@@ -169,7 +155,6 @@ async def check_and_increment_search_limit(ip: str) -> Tuple[bool, int]:
 
 
 async def get_chat_limit_status(ip: str) -> Dict[str, int]:
-    """Obtiene el contador actual sin incrementar (solo lectura)."""
     if not _redis:
         return {"used": 0, "limit": CHAT_RATE_LIMIT_MAX, "remaining": CHAT_RATE_LIMIT_MAX}
 
