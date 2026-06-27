@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import time
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -11,32 +10,42 @@ logger = logging.getLogger(__name__)
 
 _redis: Optional[redis.Redis] = None
 
-CHAT_TTL_SECONDS = 30 * 60  # 30 minutos
+CHAT_TTL_SECONDS = 30 * 60          # 30 minutos para historial
 MAX_HISTORY_MESSAGES = 20
 
 CHAT_RATE_LIMIT_MAX = 10
-CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60
+CHAT_RATE_LIMIT_TTL_SECONDS = 26 * 60 * 60   # 26 horas (para cubrir un día)
 
 SEARCH_RATE_LIMIT_MAX = 20
 SEARCH_RATE_LIMIT_TTL_SECONDS = 24 * 60 * 60
 
-# Caché en memoria para rate limits (evita llamar a Redis en cada petición)
-# Estructura: {f"{prefix}:{ip}": (timestamp, count)}
-_RATE_LIMIT_MEMORY: Dict[str, Tuple[float, int]] = {}
-_RATE_LIMIT_MEMORY_TTL = 2  # segundos
 
-
-# ========== INICIALIZACIÓN ==========
+# ========== INICIALIZACIÓN con keepalive ==========
 
 async def init_redis():
     global _redis
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         raise RuntimeError("REDIS_URL no configurada")
-    _redis = redis.from_url(redis_url, decode_responses=True)
+
+    # Configuración robusta: keepalive, timeouts, reintentos
+    _redis = redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_keepalive=True,
+        socket_keepalive_options={
+            1: 30,   # TCP_KEEPIDLE (segundos)
+            2: 10,   # TCP_KEEPINTVL
+            3: 3     # TCP_KEEPCNT
+        },
+        socket_timeout=5,
+        retry_on_timeout=True,
+        health_check_interval=30,
+        max_connections=20,
+    )
+
     await _redis.ping()
-    logger.info("Conexión a Redis establecida")
-    return _redis
+    logger.info("Conexión a Redis establecida con keepalive")
 
 
 async def close_redis():
@@ -77,13 +86,11 @@ async def append_chat_messages(
         return
     key = _chat_key(puuid, champion_id)
 
-    # Leer historial actual
     history = await get_chat_history(puuid, champion_id)
     history.append({"role": "user", "text": user_message})
     history.append({"role": "champion", "text": champion_message})
     history = history[-MAX_HISTORY_MESSAGES:]
 
-    # Guardar de una vez (un solo SET con TTL)
     await _redis.set(key, json.dumps(history), ex=CHAT_TTL_SECONDS)
 
 
@@ -93,85 +100,83 @@ async def clear_chat_history(puuid: str, champion_id: str) -> None:
     await _redis.delete(_chat_key(puuid, champion_id))
 
 
-# ========== RATE LIMITS (con caché en memoria) ==========
+# ========== RATE LIMIT con script Lua (una sola llamada) ==========
 
-def _rate_limit_key(ip: str, prefix: str) -> str:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"ratelimit:{prefix}:{ip}:{today}"
+# Script Lua: incrementa y devuelve el contador, además pone expire si es nueva clave.
+# Recibe: KEYS[1] = clave, ARGV[1] = TTL en segundos, ARGV[2] = límite máximo.
+# Devuelve: [contador, excedido?] (excedido = 1 si contador > límite)
+RATE_LIMIT_LUA = """
+    local key = KEYS[1]
+    local ttl = tonumber(ARGV[1])
+    local limit = tonumber(ARGV[2])
+    local current = redis.call('INCR', key)
+    if current == 1 then
+        redis.call('EXPIRE', key, ttl)
+    end
+    local exceeded = 0
+    if current > limit then
+        exceeded = 1
+    end
+    return {current, exceeded}
+"""
+
+# Registrar el script al iniciar (se hará una sola vez)
+_LUA_RATE_LIMIT = None
 
 
-async def check_and_increment_rate_limit(ip: str, prefix: str, max_requests: int, ttl_seconds: int) -> Tuple[bool, int]:
-    """Devuelve (permitido, contador_actual) usando caché en memoria + Redis."""
-    now = time.time()
-    cache_key = f"{prefix}:{ip}"
+async def _get_rate_limit_script():
+    global _LUA_RATE_LIMIT
+    if _LUA_RATE_LIMIT is None:
+        if not _redis:
+            return None
+        _LUA_RATE_LIMIT = await _redis.register_script(RATE_LIMIT_LUA)
+    return _LUA_RATE_LIMIT
 
-    # 1. ¿Tenemos un valor en memoria y aún no ha expirado?
-    if cache_key in _RATE_LIMIT_MEMORY:
-        ts, count = _RATE_LIMIT_MEMORY[cache_key]
-        if now - ts < _RATE_LIMIT_MEMORY_TTL:
-            # Incrementar localmente
-            new_count = count + 1
-            _RATE_LIMIT_MEMORY[cache_key] = (now, new_count)
-            if new_count > max_requests:
-                return False, new_count
-            return True, new_count
 
-    # 2. Si no está en caché o expiró, leer/actualizar desde Redis (con pipeline)
+async def check_and_increment_rate_limit(
+    ip: str, prefix: str, max_requests: int, ttl_seconds: int
+) -> Tuple[bool, int]:
+    """Devuelve (permitido, contador_actual) usando script Lua en una sola llamada."""
     if not _redis:
-        # Sin Redis, permitimos todo (modo inseguro, pero para desarrollo)
+        # Sin Redis, permitir (modo inseguro, solo para desarrollo)
         return True, 0
 
-    key = _rate_limit_key(ip, prefix)
-    pipe = _redis.pipeline()
-    pipe.incr(key)
-    pipe.expire(key, ttl_seconds)
-    results = await pipe.execute()
-    current = results[0]  # valor después de incr
+    key = f"ratelimit:{prefix}:{ip}:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    script = await _get_rate_limit_script()
+    if script is None:
+        return True, 0
 
-    # Guardar en memoria con el timestamp actual
-    _RATE_LIMIT_MEMORY[cache_key] = (now, current)
-
-    if current > max_requests:
-        return False, current
-    return True, current
+    try:
+        current, exceeded = await script(keys=[key], args=[ttl_seconds, max_requests])
+        allowed = (exceeded == 0)
+        return allowed, current
+    except Exception as e:
+        logger.exception("Error ejecutando script de rate-limit")
+        # En caso de error, permitimos (pero registramos)
+        return True, 0
 
 
 async def check_and_increment_chat_limit(ip: str) -> Tuple[bool, int]:
-    return await check_and_increment_rate_limit(ip, "chat", CHAT_RATE_LIMIT_MAX, CHAT_RATE_LIMIT_TTL_SECONDS)
+    return await check_and_increment_rate_limit(
+        ip, "chat", CHAT_RATE_LIMIT_MAX, CHAT_RATE_LIMIT_TTL_SECONDS
+    )
 
 
 async def check_and_increment_search_limit(ip: str) -> Tuple[bool, int]:
-    return await check_and_increment_rate_limit(ip, "search", SEARCH_RATE_LIMIT_MAX, SEARCH_RATE_LIMIT_TTL_SECONDS)
+    return await check_and_increment_rate_limit(
+        ip, "search", SEARCH_RATE_LIMIT_MAX, SEARCH_RATE_LIMIT_TTL_SECONDS
+    )
 
 
 async def get_chat_limit_status(ip: str) -> Dict[str, int]:
-    """Devuelve el estado actual del límite de chat, usando caché en memoria si es posible."""
-    now = time.time()
-    cache_key = f"chat:{ip}"
-
-    # Intentar leer de memoria
-    if cache_key in _RATE_LIMIT_MEMORY:
-        ts, count = _RATE_LIMIT_MEMORY[cache_key]
-        if now - ts < _RATE_LIMIT_MEMORY_TTL:
-            used = min(count, CHAT_RATE_LIMIT_MAX)
-            return {
-                "used": used,
-                "limit": CHAT_RATE_LIMIT_MAX,
-                "remaining": max(0, CHAT_RATE_LIMIT_MAX - used),
-            }
-
-    # Si no, leer de Redis
+    """Obtiene el contador actual sin incrementar (solo lectura)."""
     if not _redis:
         return {"used": 0, "limit": CHAT_RATE_LIMIT_MAX, "remaining": CHAT_RATE_LIMIT_MAX}
 
-    key = _rate_limit_key(ip, "chat")
+    key = f"ratelimit:chat:{ip}:{datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
     raw = await _redis.get(key)
     used = int(raw) if raw else 0
     used = min(used, CHAT_RATE_LIMIT_MAX)
-
-    # Guardar en memoria para próximas consultas
-    _RATE_LIMIT_MEMORY[cache_key] = (now, used)
-
     return {
         "used": used,
         "limit": CHAT_RATE_LIMIT_MAX,

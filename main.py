@@ -8,7 +8,6 @@ from typing import Optional, Tuple
 import jwt
 from datetime import datetime, timedelta, timezone
 import secrets
-from time import time
 
 from riot import get_summoner_and_mastery, REGION_MAP, get_cached_player_info
 from riot_client import _get_champion_map
@@ -93,6 +92,8 @@ async def startup():
     await init_db()
     await init_redis()
     await _get_champion_map()
+    # Mostrar advertencia si hay múltiples workers (no podemos saberlo fácilmente)
+    logger.info("Servidor iniciado. Si usas múltiples workers, asegúrate de que Redis esté configurado correctamente.")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -107,7 +108,7 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 async def _resolve_champion_id(champion_id: str) -> Tuple[int, str]:
-    champion_map = await _get_champion_map()  # {int: nombre}
+    champion_map = await _get_champion_map()
     name_to_id = {nombre: id_num for id_num, nombre in champion_map.items()}
     try:
         num_id = int(champion_id)
@@ -177,7 +178,7 @@ async def _handle_summoner(summoner_name: str, region: str, http_request: Reques
         logger.exception("Error interno en /api/summoner")
         raise HTTPException(status_code=500, detail="Error interno del servidor. Intenta más tarde.")
 
-# ==================== /api/chat SIN AUTENTICACIÓN JWT ====================
+# ==================== /api/chat ====================
 @app.post("/api/chat")
 async def chat(
     request: ChatRequest,
@@ -192,7 +193,6 @@ async def chat(
 
     champion_title = request.championTitle or "Campeón de League of Legends"
 
-    # Rate limit de chat (con caché en memoria)
     ip = get_client_ip(http_request)
     allowed, used = await check_and_increment_chat_limit(ip)
     if not allowed:
@@ -226,7 +226,6 @@ async def chat(
 @app.get("/api/chat/limit")
 async def chat_limit(http_request: Request):
     ip = get_client_ip(http_request)
-    # Usa la función mejorada que también cachea en memoria
     status = await get_chat_limit_status(ip)
     return status
 
@@ -265,4 +264,7 @@ async def delete_chat_history(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Recomendación: usar UN SOLO worker para que la caché en memoria (si se usara) funcione.
+    # Pero ahora usamos Redis con Lua, así que podemos tener varios.
+    # Sin embargo, para evitar problemas de conexión, mantenemos 1 worker.
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
