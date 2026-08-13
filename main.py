@@ -23,7 +23,13 @@ from redis_client import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ai-chat")
 
-app = FastAPI(title="AI Chat Backend", version="1.0.0")
+app = FastAPI(
+    title="AI Chat Backend", 
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+    )
 
 # ==================== CORS ====================
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://chatwithyourmain.andresrosalez.dev").split(",")
